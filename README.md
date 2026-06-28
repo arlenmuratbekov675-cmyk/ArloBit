@@ -1,4 +1,4 @@
-# ArloBit Solana Scanner v0.2
+# ArloBit Solana Scanner v0.3
 
 Standalone terminal scanner for fresh Solana token pairs using the free
 DexScreener API.
@@ -32,9 +32,9 @@ Optional:
 python scanner_v0.py --limit 20 --max-age-hours 24 --candidate-limit 100
 ```
 
-## Data Source
+## Data Sources
 
-v0.2 starts from fresh DexScreener Solana token candidates:
+v0.3 starts from fresh DexScreener Solana token candidates:
 
 - `GET /token-profiles/latest/v1`
 - `GET /token-boosts/latest/v1`
@@ -48,17 +48,40 @@ Pair age comes from `pairCreatedAt`. By default, rows are included when pair age
 is greater than 10 minutes and less than 24 hours. Missing `pairCreatedAt` is
 shown as `unknown` and scored as `RISKY`.
 
+v0.3 also checks the Solana mint account for each token:
+
+- `getAccountInfo` on the token mint address
+- SPL Token Mint layout parsing from base64 account data
+- `mint_auth` shows whether mint authority is still active
+- `freeze_auth` shows whether freeze authority is still active
+
+The default RPC is:
+
+```text
+https://api.mainnet-beta.solana.com
+```
+
+Set a custom RPC endpoint with:
+
+```powershell
+$env:SOLANA_RPC_URL="https://your-rpc.example"
+python scanner_v0.py
+```
+
 ## Verdicts
 
 `SAFE` requires several conditions to pass, including fresh age, strong
-liquidity, useful 5-minute volume, non-anomalous volume/liquidity ratio, and no
-sharp 5-minute drawdown.
+liquidity, useful 5-minute volume, non-anomalous volume/liquidity ratio, no
+sharp 5-minute drawdown, inactive mint authority, and inactive freeze authority.
 
 `RISKY` is used for unclear or mixed data, including missing age, low liquidity,
-no 5-minute volume, or mild volume/liquidity anomalies.
+no 5-minute volume, mild volume/liquidity anomalies, RPC failure, or unparseable
+mint account data.
 
 `SCAM_LIKELY` is used for clear danger signals:
 
+- active mint authority
+- active freeze authority
 - very low liquidity
 - severe volume/liquidity anomaly
 - price change 5m below `-30%`

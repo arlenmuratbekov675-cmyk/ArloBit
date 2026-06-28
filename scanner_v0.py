@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-ArloBit Solana Scanner v0.2
+ArloBit Solana Scanner v0.3
 
 Scans fresh Solana token profiles/boosts from the free DexScreener API,
 fetches pair details, filters by pairCreatedAt, and prints a compact
-terminal risk table.
+terminal risk table. v0.3 adds Solana RPC mint/freeze authority checks.
 
 This script never trades, never loads private keys, and never sends messages.
 """
@@ -12,10 +12,12 @@ This script never trades, never loads private keys, and never sends messages.
 from __future__ import annotations
 
 import argparse
+import base64
+import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any
 
 try:
     import truststore
@@ -32,6 +34,7 @@ SOLANA = "solana"
 PROFILE_URL = f"{BASE_URL}/token-profiles/latest/v1"
 BOOSTS_URL = f"{BASE_URL}/token-boosts/latest/v1"
 TOKEN_PAIRS_URL = f"{BASE_URL}/token-pairs/v1/{{chain_id}}/{{token_address}}"
+DEFAULT_SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
 
 DEFAULT_MIN_AGE_MINUTES = 10
 DEFAULT_MAX_AGE_HOURS = 24
@@ -43,6 +46,7 @@ MAX_SAFE_VOLUME_LIQUIDITY_RATIO = 1.0
 ANOMALY_VOLUME_LIQUIDITY_RATIO = 2.0
 MIN_SAFE_PRICE_CHANGE_5M = -30
 EXTREME_PUMP_5M = 150
+SPL_MINT_ACCOUNT_MIN_SIZE = 82
 
 
 @dataclass(frozen=True)
@@ -60,9 +64,18 @@ class PairRow:
     volume_5m: float
     age_minutes: float | None
     price_change_5m: float
+    mint_authority_active: bool | None
+    freeze_authority_active: bool | None
     verdict: str
     signals: tuple[str, ...]
     source: str
+
+
+@dataclass(frozen=True)
+class MintAuthorityStatus:
+    mint_authority_active: bool | None
+    freeze_authority_active: bool | None
+    issue: str | None = None
 
 
 def number(value: Any, default: float = 0.0) -> float:
@@ -86,6 +99,64 @@ def as_items(payload: Any) -> list[dict[str, Any]]:
     if isinstance(payload, dict):
         return [payload]
     return []
+
+
+def fetch_mint_account(
+    session: requests.Session,
+    rpc_url: str,
+    token_address: str,
+    timeout: int,
+) -> MintAuthorityStatus:
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getAccountInfo",
+        "params": [
+            token_address,
+            {"encoding": "base64", "commitment": "confirmed"},
+        ],
+    }
+
+    try:
+        response = session.post(rpc_url, json=payload, timeout=timeout)
+        response.raise_for_status()
+        rpc_payload = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        return MintAuthorityStatus(None, None, f"rpc_failed:{exc}")
+
+    if rpc_payload.get("error"):
+        message = rpc_payload["error"].get("message", "unknown")
+        return MintAuthorityStatus(None, None, f"rpc_error:{message}")
+
+    value = (rpc_payload.get("result") or {}).get("value")
+    if not value:
+        return MintAuthorityStatus(None, None, "mint_account_missing")
+
+    data = value.get("data")
+    if not isinstance(data, list) or not data:
+        return MintAuthorityStatus(None, None, "mint_data_missing")
+
+    try:
+        raw = base64.b64decode(data[0])
+        return parse_spl_mint_account(raw)
+    except (TypeError, ValueError) as exc:
+        return MintAuthorityStatus(None, None, f"mint_unparseable:{exc}")
+
+
+def parse_spl_mint_account(raw: bytes) -> MintAuthorityStatus:
+    if len(raw) < SPL_MINT_ACCOUNT_MIN_SIZE:
+        return MintAuthorityStatus(None, None, "mint_account_too_short")
+
+    mint_authority_option = int.from_bytes(raw[0:4], "little")
+    freeze_authority_option = int.from_bytes(raw[46:50], "little")
+    valid_options = {0, 1}
+    if mint_authority_option not in valid_options or freeze_authority_option not in valid_options:
+        return MintAuthorityStatus(None, None, "mint_option_unparseable")
+
+    return MintAuthorityStatus(
+        mint_authority_active=mint_authority_option == 1,
+        freeze_authority_active=freeze_authority_option == 1,
+    )
 
 
 def fetch_candidates(session: requests.Session, timeout: int) -> tuple[list[Candidate], list[str]]:
@@ -152,6 +223,7 @@ def score_pair(
     volume_5m: float,
     age_minutes: float | None,
     price_change_5m: float,
+    mint_status: MintAuthorityStatus,
 ) -> tuple[str, tuple[str, ...]]:
     danger: list[str] = []
     risk: list[str] = []
@@ -172,6 +244,8 @@ def score_pair(
         risk.append("low_liq")
     elif liquidity > SAFE_MIN_LIQUIDITY_USD:
         pass_count += 1
+    else:
+        risk.append("weak_liq")
 
     if volume_5m > SAFE_MIN_VOLUME_5M:
         pass_count += 1
@@ -197,20 +271,42 @@ def score_pair(
     else:
         pass_count += 1
 
+    if mint_status.mint_authority_active is True:
+        danger.append("mint_auth_active")
+    elif mint_status.mint_authority_active is False:
+        pass_count += 1
+    else:
+        risk.append("mint_auth_unknown")
+
+    if mint_status.freeze_authority_active is True:
+        danger.append("freeze_auth_active")
+    elif mint_status.freeze_authority_active is False:
+        pass_count += 1
+    else:
+        risk.append("freeze_auth_unknown")
+
+    if mint_status.issue:
+        risk.append(mint_status.issue.split(":", 1)[0])
+
     if danger:
         return "SCAM_LIKELY", tuple(danger + risk)
-    if risk or pass_count < 4:
+    if risk or pass_count < 6:
         return "RISKY", tuple(risk or ["mixed"])
     return "SAFE", ("fresh",)
 
 
-def to_row(pair: dict[str, Any], candidate: Candidate, now_ms: int) -> PairRow:
+def to_row(
+    pair: dict[str, Any],
+    candidate: Candidate,
+    now_ms: int,
+    mint_status: MintAuthorityStatus,
+) -> PairRow:
     token = base_token_for_candidate(pair, candidate.token_address)
     liquidity = number((pair.get("liquidity") or {}).get("usd"))
     volume_5m = number((pair.get("volume") or {}).get("m5"))
     price_change_5m = number((pair.get("priceChange") or {}).get("m5"))
     age_minutes = pair_age_minutes(pair, now_ms)
-    verdict, signals = score_pair(liquidity, volume_5m, age_minutes, price_change_5m)
+    verdict, signals = score_pair(liquidity, volume_5m, age_minutes, price_change_5m, mint_status)
 
     return PairRow(
         token=str(token.get("name") or "Unknown"),
@@ -220,6 +316,8 @@ def to_row(pair: dict[str, Any], candidate: Candidate, now_ms: int) -> PairRow:
         volume_5m=volume_5m,
         age_minutes=age_minutes,
         price_change_5m=price_change_5m,
+        mint_authority_active=mint_status.mint_authority_active,
+        freeze_authority_active=mint_status.freeze_authority_active,
         verdict=verdict,
         signals=signals,
         source=candidate.source,
@@ -233,13 +331,20 @@ def collect_rows(
     min_age_minutes: int,
     max_age_hours: int,
     candidate_limit: int,
+    rpc_url: str,
 ) -> tuple[list[PairRow], list[str], int]:
     candidates, issues = fetch_candidates(session, timeout)
     now_ms = int(time.time() * 1000)
     seen_pairs: set[str] = set()
+    mint_cache: dict[str, MintAuthorityStatus] = {}
     rows: list[PairRow] = []
 
     for candidate in candidates[:candidate_limit]:
+        mint_status = mint_cache.get(candidate.token_address)
+        if mint_status is None:
+            mint_status = fetch_mint_account(session, rpc_url, candidate.token_address, timeout)
+            mint_cache[candidate.token_address] = mint_status
+
         try:
             pairs = fetch_token_pairs(session, candidate.token_address, timeout)
         except requests.RequestException as exc:
@@ -252,7 +357,7 @@ def collect_rows(
                 continue
             seen_pairs.add(pair_address)
 
-            row = to_row(pair, candidate, now_ms)
+            row = to_row(pair, candidate, now_ms, mint_status)
             if row.age_minutes is None:
                 rows.append(row)
                 continue
@@ -306,6 +411,14 @@ def terminal_text(value: str, max_length: int) -> str:
     return clean[:max_length]
 
 
+def bool_status(value: bool | None) -> str:
+    if value is True:
+        return "yes"
+    if value is False:
+        return "no"
+    return "unknown"
+
+
 def render_table(rows: list[PairRow]) -> str:
     headers = [
         "token",
@@ -315,6 +428,8 @@ def render_table(rows: list[PairRow]) -> str:
         "volume_5m",
         "age",
         "price_change_5m",
+        "mint_auth",
+        "freeze_auth",
         "verdict",
         "signals",
     ]
@@ -327,6 +442,8 @@ def render_table(rows: list[PairRow]) -> str:
             money(row.volume_5m),
             age(row.age_minutes),
             f"{row.price_change_5m:.2f}%",
+            bool_status(row.mint_authority_active),
+            bool_status(row.freeze_authority_active),
             row.verdict,
             ",".join(row.signals)[:28],
         ]
@@ -361,6 +478,11 @@ def parse_args() -> argparse.Namespace:
         default=80,
         help="maximum fresh profile/boost tokens to resolve into pair details",
     )
+    parser.add_argument(
+        "--rpc-url",
+        default=os.environ.get("SOLANA_RPC_URL", DEFAULT_SOLANA_RPC_URL),
+        help="Solana RPC URL; defaults to SOLANA_RPC_URL env var or public mainnet RPC",
+    )
     return parser.parse_args()
 
 
@@ -371,7 +493,7 @@ def main() -> int:
         return 2
 
     session = requests.Session()
-    session.headers.update({"Accept": "application/json", "User-Agent": "ArloBit/0.2"})
+    session.headers.update({"Accept": "application/json", "User-Agent": "ArloBit/0.3"})
 
     rows, issues, candidate_count = collect_rows(
         session=session,
@@ -380,6 +502,7 @@ def main() -> int:
         min_age_minutes=args.min_age_minutes,
         max_age_hours=args.max_age_hours,
         candidate_limit=args.candidate_limit,
+        rpc_url=args.rpc_url,
     )
 
     print(render_table(rows))
