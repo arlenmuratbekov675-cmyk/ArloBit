@@ -1,4 +1,4 @@
-# ArloBit Solana Scanner v0.3
+# ArloBit Solana Scanner v0.4
 
 Standalone terminal scanner for fresh Solana token pairs using the free
 DexScreener API.
@@ -9,7 +9,6 @@ DexScreener API.
 - No API key
 - No private keys
 - No auto-buy
-- No Telegram integration
 
 ## Install
 
@@ -34,7 +33,7 @@ python scanner_v0.py --limit 20 --max-age-hours 24 --candidate-limit 100
 
 ## Data Sources
 
-v0.3 starts from fresh DexScreener Solana token candidates:
+v0.4 starts from fresh DexScreener Solana token candidates:
 
 - `GET /token-profiles/latest/v1`
 - `GET /token-boosts/latest/v1`
@@ -48,7 +47,7 @@ Pair age comes from `pairCreatedAt`. By default, rows are included when pair age
 is greater than 10 minutes and less than 24 hours. Missing `pairCreatedAt` is
 shown as `unknown` and scored as `RISKY`.
 
-v0.3 also checks the Solana mint account for each token:
+v0.4 also checks the Solana mint account for each token:
 
 - `getAccountInfo` on the token mint address
 - SPL Token Mint layout parsing from base64 account data
@@ -67,6 +66,43 @@ Set a custom RPC endpoint with:
 $env:SOLANA_RPC_URL="https://your-rpc.example"
 python scanner_v0.py
 ```
+
+## Telegram Alerts
+
+Telegram is optional. If `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID` is missing,
+the scanner still runs and prints:
+
+```text
+Telegram disabled: missing env vars
+```
+
+Alerts are sent only for rows that are already `SAFE`, have `mint_auth=no`,
+have `freeze_auth=no`, and are between 10 minutes and 24 hours old. The scanner
+deduplicates alerts by mint in a run and keeps a local `.arlobit_alerts.json`
+state file to limit Telegram alerts to 2 per hour.
+
+To create a Telegram bot:
+
+1. Open Telegram and message `@BotFather`.
+2. Send `/newbot`.
+3. Follow the prompts and copy the bot token.
+
+To get `TELEGRAM_CHAT_ID`:
+
+1. Send a message to your new bot, or add it to a group and send a message there.
+2. Open `https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates` in a browser.
+3. Find `chat.id` in the JSON response.
+
+Set env vars in PowerShell:
+
+```powershell
+$env:TELEGRAM_BOT_TOKEN="123456789:your_bot_token"
+$env:TELEGRAM_CHAT_ID="123456789"
+$env:SOLANA_RPC_URL="https://api.mainnet-beta.solana.com"
+python scanner_v0.py --limit 20 --candidate-limit 100
+```
+
+See `.env.example` for the expected variable names.
 
 ## Verdicts
 

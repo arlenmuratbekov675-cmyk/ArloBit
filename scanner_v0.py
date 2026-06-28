@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
-ArloBit Solana Scanner v0.3
+ArloBit Solana Scanner v0.4
 
 Scans fresh Solana token profiles/boosts from the free DexScreener API,
 fetches pair details, filters by pairCreatedAt, and prints a compact
-terminal risk table. v0.3 adds Solana RPC mint/freeze authority checks.
+terminal risk table. v0.4 adds optional Telegram alerts for SAFE tokens.
 
-This script never trades, never loads private keys, and never sends messages.
+This script never trades and never loads private keys.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import json
 import os
 import sys
 import time
@@ -35,9 +36,12 @@ PROFILE_URL = f"{BASE_URL}/token-profiles/latest/v1"
 BOOSTS_URL = f"{BASE_URL}/token-boosts/latest/v1"
 TOKEN_PAIRS_URL = f"{BASE_URL}/token-pairs/v1/{{chain_id}}/{{token_address}}"
 DEFAULT_SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
+TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
+TELEGRAM_STATE_FILE = ".arlobit_alerts.json"
 
 DEFAULT_MIN_AGE_MINUTES = 10
 DEFAULT_MAX_AGE_HOURS = 24
+TELEGRAM_ALERT_LIMIT_PER_HOUR = 2
 SAFE_MIN_LIQUIDITY_USD = 20_000
 SAFE_MIN_VOLUME_5M = 5_000
 VERY_LOW_LIQUIDITY_USD = 1_000
@@ -57,6 +61,8 @@ class Candidate:
 
 @dataclass(frozen=True)
 class PairRow:
+    token_address: str
+    dex_url: str
     token: str
     symbol: str
     price: float
@@ -218,6 +224,16 @@ def base_token_for_candidate(pair: dict[str, Any], token_address: str) -> dict[s
     return base
 
 
+def dexscreener_url(pair: dict[str, Any]) -> str:
+    url = str(pair.get("url") or "").strip()
+    if url:
+        return url
+    pair_address = str(pair.get("pairAddress") or "").strip()
+    if pair_address:
+        return f"https://dexscreener.com/solana/{pair_address}"
+    return "https://dexscreener.com/solana"
+
+
 def score_pair(
     liquidity: float,
     volume_5m: float,
@@ -309,6 +325,8 @@ def to_row(
     verdict, signals = score_pair(liquidity, volume_5m, age_minutes, price_change_5m, mint_status)
 
     return PairRow(
+        token_address=candidate.token_address,
+        dex_url=dexscreener_url(pair),
         token=str(token.get("name") or "Unknown"),
         symbol=str(token.get("symbol") or "?"),
         price=number(pair.get("priceUsd")),
@@ -419,6 +437,126 @@ def bool_status(value: bool | None) -> str:
     return "unknown"
 
 
+def telegram_alert_enabled() -> tuple[bool, str | None, str | None]:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return False, token, chat_id
+    return True, token, chat_id
+
+
+def should_alert(row: PairRow, min_age_minutes: int, max_age_hours: int) -> bool:
+    if row.verdict != "SAFE":
+        return False
+    if row.mint_authority_active is not False or row.freeze_authority_active is not False:
+        return False
+    if row.age_minutes is None:
+        return False
+    return min_age_minutes < row.age_minutes < max_age_hours * 60
+
+
+def telegram_message(row: PairRow) -> str:
+    return "\n".join(
+        [
+            "ArloBit SAFE Solana token",
+            f"Token: {row.token} ({row.symbol})",
+            f"Mint: {row.token_address}",
+            f"Price: {price(row.price)}",
+            f"Liquidity: {money(row.liquidity)}",
+            f"Volume 5m: {money(row.volume_5m)}",
+            f"Age: {age(row.age_minutes)}",
+            f"Price change 5m: {row.price_change_5m:.2f}%",
+            f"DexScreener: {row.dex_url}",
+            f"Verdict: {row.verdict}",
+            f"Signals: {', '.join(row.signals)}",
+        ]
+    )
+
+
+def load_telegram_state() -> dict[str, Any]:
+    try:
+        with open(TELEGRAM_STATE_FILE, "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {"sent_at": [], "mints": {}}
+    if not isinstance(state, dict):
+        return {"sent_at": [], "mints": {}}
+    if not isinstance(state.get("sent_at"), list):
+        state["sent_at"] = []
+    if not isinstance(state.get("mints"), dict):
+        state["mints"] = {}
+    return state
+
+
+def save_telegram_state(state: dict[str, Any]) -> None:
+    with open(TELEGRAM_STATE_FILE, "w", encoding="utf-8") as handle:
+        json.dump(state, handle, indent=2, sort_keys=True)
+
+
+def prune_telegram_state(state: dict[str, Any], now: float) -> dict[str, Any]:
+    cutoff = now - 3600
+    sent_at = [stamp for stamp in state.get("sent_at", []) if isinstance(stamp, (int, float)) and stamp >= cutoff]
+    mints = {
+        mint: stamp
+        for mint, stamp in state.get("mints", {}).items()
+        if isinstance(mint, str) and isinstance(stamp, (int, float)) and stamp >= cutoff
+    }
+    return {"sent_at": sent_at, "mints": mints}
+
+
+def send_telegram_alerts(
+    session: requests.Session,
+    rows: list[PairRow],
+    timeout: int,
+    min_age_minutes: int,
+    max_age_hours: int,
+) -> tuple[int, list[str]]:
+    enabled, token, chat_id = telegram_alert_enabled()
+    if not enabled:
+        print("Telegram disabled: missing env vars")
+        return 0, []
+
+    endpoint = TELEGRAM_API_URL.format(token=token)
+    now = time.time()
+    state = prune_telegram_state(load_telegram_state(), now)
+    remaining = max(0, TELEGRAM_ALERT_LIMIT_PER_HOUR - len(state["sent_at"]))
+    sent = 0
+    seen_mints: set[str] = set()
+    issues: list[str] = []
+
+    for row in rows:
+        if sent >= remaining:
+            break
+        if not should_alert(row, min_age_minutes, max_age_hours):
+            continue
+        if row.token_address in seen_mints or row.token_address in state["mints"]:
+            continue
+        seen_mints.add(row.token_address)
+
+        payload = {
+            "chat_id": chat_id,
+            "text": telegram_message(row),
+            "disable_web_page_preview": True,
+        }
+        try:
+            response = session.post(endpoint, json=payload, timeout=timeout)
+            response.raise_for_status()
+            sent += 1
+            state["sent_at"].append(time.time())
+            state["mints"][row.token_address] = time.time()
+        except requests.RequestException as exc:
+            issues.append(f"telegram:{row.token_address}: {exc}")
+
+    if sent:
+        save_telegram_state(state)
+
+    if remaining == 0:
+        print("Telegram alerts sent: 0 (hourly limit reached)")
+    else:
+        print(f"Telegram alerts sent: {sent}")
+    return sent, issues
+
+
 def render_table(rows: list[PairRow]) -> str:
     headers = [
         "token",
@@ -493,7 +631,7 @@ def main() -> int:
         return 2
 
     session = requests.Session()
-    session.headers.update({"Accept": "application/json", "User-Agent": "ArloBit/0.3"})
+    session.headers.update({"Accept": "application/json", "User-Agent": "ArloBit/0.4"})
 
     rows, issues, candidate_count = collect_rows(
         session=session,
@@ -507,6 +645,14 @@ def main() -> int:
 
     print(render_table(rows))
     print(f"\nScanned {candidate_count} latest Solana profile/boost candidates.")
+    _, telegram_issues = send_telegram_alerts(
+        session=session,
+        rows=rows,
+        timeout=args.timeout,
+        min_age_minutes=args.min_age_minutes,
+        max_age_hours=args.max_age_hours,
+    )
+    issues.extend(telegram_issues)
 
     if issues:
         print("\nAPI issues:", file=sys.stderr)
