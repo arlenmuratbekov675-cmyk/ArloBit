@@ -54,6 +54,24 @@ EXTREME_PUMP_5M = 150
 SPL_MINT_ACCOUNT_MIN_SIZE = 82
 
 
+def load_dotenv(path: str = ".env") -> None:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except FileNotFoundError:
+        return
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
 @dataclass(frozen=True)
 class Candidate:
     token_address: str
@@ -743,6 +761,7 @@ def run_loop(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    load_dotenv()
     args = parse_args()
     if args.min_age_minutes >= args.max_age_hours * 60:
         print("--min-age-minutes must be lower than --max-age-hours", file=sys.stderr)

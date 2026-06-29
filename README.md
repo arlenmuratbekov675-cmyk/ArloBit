@@ -106,6 +106,10 @@ the scanner still runs and prints:
 Telegram disabled: missing env vars
 ```
 
+The scanner auto-loads a local `.env` file at startup, so you can place
+`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and `SOLANA_RPC_URL` there instead of
+exporting them manually.
+
 Alerts are sent only for rows that are already `SAFE`, have `mint_auth=no`,
 have `freeze_auth=no`, and are between 10 minutes and 24 hours old. The scanner
 deduplicates alerts by mint in a run and keeps a local `.arlobit_alerts.json`
