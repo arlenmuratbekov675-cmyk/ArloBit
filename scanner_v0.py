@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-ArloBit Solana Scanner v0.5
+ArloBit Solana Scanner v0.6
 
 Scans fresh Solana token profiles/boosts from the free DexScreener API,
 fetches pair details, filters by pairCreatedAt, and prints a compact
-terminal risk table. v0.5 adds persistent loop mode for automatic alerts.
+terminal risk table. v0.6 adds simulated paper trading.
 
 This script never trades and never loads private keys.
 """
@@ -38,11 +38,15 @@ TOKEN_PAIRS_URL = f"{BASE_URL}/token-pairs/v1/{{chain_id}}/{{token_address}}"
 DEFAULT_SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 TELEGRAM_STATE_FILE = ".arlobit_alerts.json"
+PAPER_TRADES_FILE = "paper_trades.json"
 DEFAULT_LOOP_INTERVAL_SECONDS = 180
 
 DEFAULT_MIN_AGE_MINUTES = 10
 DEFAULT_MAX_AGE_HOURS = 24
-TELEGRAM_ALERT_LIMIT_PER_HOUR = 2
+DEFAULT_TELEGRAM_ALERT_LIMIT_PER_HOUR = 2
+PAPER_TAKE_PROFIT_PERCENT = 50
+PAPER_STOP_LOSS_PERCENT = -30
+PAPER_MAX_HOLD_SECONDS = 6 * 60 * 60
 SAFE_MIN_LIQUIDITY_USD = 20_000
 SAFE_MIN_VOLUME_5M = 5_000
 VERY_LOW_LIQUIDITY_USD = 1_000
@@ -111,6 +115,8 @@ class ScanResult:
     pairs_scanned: int
     safe_count: int
     alerts_sent: int
+    paper_opened: int
+    paper_closed: int
 
 
 def number(value: Any, default: float = 0.0) -> float:
@@ -231,6 +237,17 @@ def fetch_token_pairs(session: requests.Session, token_address: str, timeout: in
         pairs = payload.get("pairs") or []
         return [pair for pair in pairs if isinstance(pair, dict) and pair.get("chainId") == SOLANA]
     return []
+
+
+def fetch_current_price(session: requests.Session, token_address: str, timeout: int) -> float | None:
+    pairs = fetch_token_pairs(session, token_address, timeout)
+    if not pairs:
+        return None
+    pairs.sort(key=lambda pair: number((pair.get("liquidity") or {}).get("usd")), reverse=True)
+    price_usd = number(pairs[0].get("priceUsd"), default=-1.0)
+    if price_usd <= 0:
+        return None
+    return price_usd
 
 
 def pair_age_minutes(pair: dict[str, Any], now_ms: int) -> float | None:
@@ -504,6 +521,171 @@ def telegram_message(row: PairRow) -> str:
     )
 
 
+def paper_open_message(trade: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "ArloBit PAPER trade opened",
+            f"Token: {trade.get('symbol', '?')}",
+            f"Mint: {trade.get('mint', '?')}",
+            f"Entry: {price(number(trade.get('entry_price')))}",
+            f"Liquidity: {money(number(trade.get('liquidity_at_entry')))}",
+            f"Source: {trade.get('source', 'unknown')}",
+            "Mode: simulated paper trade only",
+        ]
+    )
+
+
+def paper_close_message(trade: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "ArloBit PAPER trade closed",
+            f"Token: {trade.get('symbol', '?')}",
+            f"Mint: {trade.get('mint', '?')}",
+            f"Exit: {price(number(trade.get('exit_price')))}",
+            f"Reason: {trade.get('exit_reason', 'unknown')}",
+            f"Final PnL: {number(trade.get('final_pnl_percent')):.2f}%",
+            f"Max gain: {number(trade.get('max_gain')):.2f}%",
+            f"Max drawdown: {number(trade.get('max_drawdown')):.2f}%",
+            "Mode: simulated paper trade only",
+        ]
+    )
+
+
+def load_paper_trades() -> dict[str, Any]:
+    try:
+        with open(PAPER_TRADES_FILE, "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {"trades": []}
+    if not isinstance(state, dict) or not isinstance(state.get("trades"), list):
+        return {"trades": []}
+    return state
+
+
+def save_paper_trades(state: dict[str, Any]) -> None:
+    with open(PAPER_TRADES_FILE, "w", encoding="utf-8") as handle:
+        json.dump(state, handle, indent=2, sort_keys=True)
+
+
+def open_trade_mints(state: dict[str, Any]) -> set[str]:
+    return {
+        str(trade.get("mint"))
+        for trade in state.get("trades", [])
+        if isinstance(trade, dict) and trade.get("status") == "open" and trade.get("mint")
+    }
+
+
+def all_trade_mints(state: dict[str, Any]) -> set[str]:
+    return {
+        str(trade.get("mint"))
+        for trade in state.get("trades", [])
+        if isinstance(trade, dict) and trade.get("mint")
+    }
+
+
+def pnl_percent(entry_price: float, current_price: float) -> float:
+    if entry_price <= 0:
+        return 0.0
+    return ((current_price - entry_price) / entry_price) * 100
+
+
+def update_open_paper_trades(
+    session: requests.Session,
+    state: dict[str, Any],
+    timeout: int,
+) -> tuple[int, list[str], list[str]]:
+    now = time.time()
+    closed = 0
+    issues: list[str] = []
+    messages: list[str] = []
+
+    for trade in state.get("trades", []):
+        if not isinstance(trade, dict) or trade.get("status") != "open":
+            continue
+
+        mint = str(trade.get("mint") or "")
+        current_price = fetch_current_price(session, mint, timeout)
+        if current_price is None:
+            issues.append(f"paper:{mint}: price_unavailable")
+            continue
+
+        entry_price = number(trade.get("entry_price"))
+        pnl = pnl_percent(entry_price, current_price)
+        trade["current_price"] = current_price
+        trade["current_pnl_percent"] = pnl
+        trade["last_checked"] = now
+        trade["max_gain"] = max(number(trade.get("max_gain")), pnl)
+        trade["max_drawdown"] = min(number(trade.get("max_drawdown")), pnl)
+
+        entry_time = number(trade.get("entry_time"))
+        exit_reason = None
+        if pnl >= PAPER_TAKE_PROFIT_PERCENT:
+            exit_reason = "take_profit"
+        elif pnl <= PAPER_STOP_LOSS_PERCENT:
+            exit_reason = "stop_loss"
+        elif entry_time > 0 and now - entry_time >= PAPER_MAX_HOLD_SECONDS:
+            exit_reason = "max_hold_time"
+
+        if exit_reason:
+            trade["status"] = "closed"
+            trade["exit_price"] = current_price
+            trade["exit_time"] = now
+            trade["exit_reason"] = exit_reason
+            trade["final_pnl_percent"] = pnl
+            closed += 1
+            messages.append(paper_close_message(trade))
+
+    return closed, issues, messages
+
+
+def open_paper_trades(rows: list[PairRow], min_age_minutes: int, max_age_hours: int) -> tuple[int, list[str]]:
+    state = load_paper_trades()
+    existing_mints = all_trade_mints(state)
+    opened = 0
+    messages: list[str] = []
+    now = time.time()
+
+    for row in rows:
+        if not should_alert(row, min_age_minutes, max_age_hours):
+            continue
+        if row.token_address in existing_mints:
+            continue
+
+        trade = {
+            "mint": row.token_address,
+            "symbol": row.symbol,
+            "entry_price": row.price,
+            "entry_time": now,
+            "liquidity_at_entry": row.liquidity,
+            "source": row.source,
+            "status": "open",
+            "current_price": row.price,
+            "current_pnl_percent": 0.0,
+            "max_gain": 0.0,
+            "max_drawdown": 0.0,
+            "dex_url": row.dex_url,
+        }
+        state["trades"].append(trade)
+        existing_mints.add(row.token_address)
+        opened += 1
+        messages.append(paper_open_message(trade))
+
+    if opened:
+        save_paper_trades(state)
+    return opened, messages
+
+
+def update_and_save_paper_trades(
+    session: requests.Session,
+    timeout: int,
+) -> tuple[int, list[str], list[str]]:
+    state = load_paper_trades()
+    closed, issues, messages = update_open_paper_trades(session, state, timeout)
+    if state.get("trades"):
+        save_paper_trades(state)
+    return closed, issues, messages
+
+
 def load_telegram_state() -> dict[str, Any]:
     try:
         with open(TELEGRAM_STATE_FILE, "r", encoding="utf-8") as handle:
@@ -541,6 +723,7 @@ def send_telegram_alerts(
     timeout: int,
     min_age_minutes: int,
     max_age_hours: int,
+    hourly_limit: int,
 ) -> tuple[int, list[str]]:
     enabled, token, chat_id = telegram_alert_enabled()
     if not enabled:
@@ -550,7 +733,7 @@ def send_telegram_alerts(
     endpoint = TELEGRAM_API_URL.format(token=token)
     now = time.time()
     state = prune_telegram_state(load_telegram_state(), now)
-    remaining = max(0, TELEGRAM_ALERT_LIMIT_PER_HOUR - len(state["sent_at"]))
+    remaining = max(0, hourly_limit - len(state["sent_at"]))
     sent = 0
     seen_mints: set[str] = set()
     issues: list[str] = []
@@ -585,6 +768,42 @@ def send_telegram_alerts(
         print("Telegram alerts sent: 0 (hourly limit reached)")
     else:
         print(f"Telegram alerts sent: {sent}")
+    return sent, issues
+
+
+def send_telegram_messages(
+    session: requests.Session,
+    messages: list[str],
+    timeout: int,
+    hourly_limit: int,
+) -> tuple[int, list[str]]:
+    enabled, token, chat_id = telegram_alert_enabled()
+    if not enabled or not messages:
+        return 0, []
+
+    endpoint = TELEGRAM_API_URL.format(token=token)
+    state = prune_telegram_state(load_telegram_state(), time.time())
+    remaining = max(0, hourly_limit - len(state["sent_at"]))
+    sent = 0
+    issues: list[str] = []
+
+    for message in messages:
+        if sent >= remaining:
+            break
+        try:
+            response = session.post(
+                endpoint,
+                json={"chat_id": chat_id, "text": message, "disable_web_page_preview": True},
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            sent += 1
+            state["sent_at"].append(time.time())
+        except requests.RequestException as exc:
+            issues.append(f"telegram:paper: {exc}")
+
+    if sent:
+        save_telegram_state(state)
     return sent, issues
 
 
@@ -628,6 +847,39 @@ def render_table(rows: list[PairRow]) -> str:
     return "\n".join([line, divider, *body])
 
 
+def render_paper_stats() -> str:
+    trades = [trade for trade in load_paper_trades().get("trades", []) if isinstance(trade, dict)]
+    total = len(trades)
+    open_count = sum(1 for trade in trades if trade.get("status") == "open")
+    closed = [trade for trade in trades if trade.get("status") == "closed"]
+    wins = [number(trade.get("final_pnl_percent")) for trade in closed if number(trade.get("final_pnl_percent")) > 0]
+    losses = [number(trade.get("final_pnl_percent")) for trade in closed if number(trade.get("final_pnl_percent")) <= 0]
+    closed_count = len(closed)
+    final_pnls = [number(trade.get("final_pnl_percent")) for trade in closed]
+
+    win_rate = (len(wins) / closed_count * 100) if closed_count else 0.0
+    avg_win = sum(wins) / len(wins) if wins else 0.0
+    avg_loss = sum(losses) / len(losses) if losses else 0.0
+    best = max(final_pnls) if final_pnls else 0.0
+    worst = min(final_pnls) if final_pnls else 0.0
+    total_pnl = sum(final_pnls)
+
+    return "\n".join(
+        [
+            "Paper trading stats",
+            f"total trades: {total}",
+            f"open: {open_count}",
+            f"closed: {closed_count}",
+            f"win rate: {win_rate:.2f}%",
+            f"avg win: {avg_win:.2f}%",
+            f"avg loss: {avg_loss:.2f}%",
+            f"best: {best:.2f}%",
+            f"worst: {worst:.2f}%",
+            f"total simulated pnl: {total_pnl:.2f}%",
+        ]
+    )
+
+
 def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
@@ -640,6 +892,7 @@ def parse_args() -> argparse.Namespace:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--once", action="store_true", help="run one scan cycle and exit")
     mode.add_argument("--loop", action="store_true", help="run continuously until Ctrl+C")
+    mode.add_argument("--stats", action="store_true", help="show paper trading stats and exit")
     parser.add_argument(
         "--interval",
         type=positive_int,
@@ -666,6 +919,12 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("SOLANA_RPC_URL", DEFAULT_SOLANA_RPC_URL),
         help="Solana RPC URL; defaults to SOLANA_RPC_URL env var or public mainnet RPC",
     )
+    parser.add_argument(
+        "--telegram-limit",
+        type=positive_int,
+        default=positive_int(os.environ.get("TELEGRAM_ALERT_LIMIT_PER_HOUR", str(DEFAULT_TELEGRAM_ALERT_LIMIT_PER_HOUR))),
+        help="maximum Telegram messages per hour across alerts and paper trade messages",
+    )
     return parser.parse_args()
 
 
@@ -687,12 +946,22 @@ def print_health(result: ScanResult) -> None:
         f"candidates_found={result.candidate_count} "
         f"safe_count={result.safe_count} "
         f"alerts_sent={result.alerts_sent} "
+        f"paper_opened={result.paper_opened} "
+        f"paper_closed={result.paper_closed} "
         f"api_rpc_errors={error_count}"
     )
 
 
 def run_scan_once(args: argparse.Namespace) -> ScanResult:
     session = build_session()
+    paper_closed, paper_issues, paper_close_messages = update_and_save_paper_trades(session, args.timeout)
+    paper_close_alerts, paper_close_alert_issues = send_telegram_messages(
+        session=session,
+        messages=paper_close_messages,
+        timeout=args.timeout,
+        hourly_limit=args.telegram_limit,
+    )
+
     rows, issues, candidate_count, pairs_scanned = collect_rows(
         session=session,
         limit=args.limit,
@@ -711,15 +980,31 @@ def run_scan_once(args: argparse.Namespace) -> ScanResult:
         timeout=args.timeout,
         min_age_minutes=args.min_age_minutes,
         max_age_hours=args.max_age_hours,
+        hourly_limit=args.telegram_limit,
     )
     issues.extend(telegram_issues)
+    paper_opened, paper_open_messages = open_paper_trades(rows, args.min_age_minutes, args.max_age_hours)
+    paper_open_alerts, paper_open_alert_issues = send_telegram_messages(
+        session=session,
+        messages=paper_open_messages,
+        timeout=args.timeout,
+        hourly_limit=args.telegram_limit,
+    )
+    issues.extend(paper_issues)
+    issues.extend(paper_close_alert_issues)
+    issues.extend(paper_open_alert_issues)
+    paper_alerts_sent = paper_close_alerts + paper_open_alerts
+    if paper_opened or paper_closed:
+        print(f"Paper trades: opened={paper_opened} closed={paper_closed} paper_alerts_sent={paper_alerts_sent}")
     result = ScanResult(
         rows=rows,
         issues=issues,
         candidate_count=candidate_count,
         pairs_scanned=pairs_scanned,
         safe_count=sum(1 for row in rows if row.verdict == "SAFE"),
-        alerts_sent=alerts_sent,
+        alerts_sent=alerts_sent + paper_alerts_sent,
+        paper_opened=paper_opened,
+        paper_closed=paper_closed,
     )
     print_health(result)
 
@@ -772,6 +1057,9 @@ def main() -> int:
 
     if args.loop:
         return run_loop(args)
+    if args.stats:
+        print(render_paper_stats())
+        return 0
 
     run_scan_once(args)
     return 0

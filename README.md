@@ -1,4 +1,4 @@
-# ArloBit Solana Scanner v0.5
+# ArloBit Solana Scanner v0.6
 
 Standalone terminal scanner for fresh Solana token pairs using the free
 DexScreener API.
@@ -63,7 +63,7 @@ prints health output, and continues instead of exiting permanently.
 
 ## Data Sources
 
-v0.5 starts from fresh DexScreener Solana token candidates:
+v0.6 starts from fresh DexScreener Solana token candidates:
 
 - `GET /token-profiles/latest/v1`
 - `GET /token-boosts/latest/v1`
@@ -77,7 +77,7 @@ Pair age comes from `pairCreatedAt`. By default, rows are included when pair age
 is greater than 10 minutes and less than 24 hours. Missing `pairCreatedAt` is
 shown as `unknown` and scored as `RISKY`.
 
-v0.5 also checks the Solana mint account for each token:
+v0.6 also checks the Solana mint account for each token:
 
 - `getAccountInfo` on the token mint address
 - SPL Token Mint layout parsing from base64 account data
@@ -138,6 +138,45 @@ python scanner_v0.py --limit 20 --candidate-limit 100
 ```
 
 See `.env.example` for the expected variable names.
+
+Set a custom Telegram rate limit with:
+
+```powershell
+$env:TELEGRAM_ALERT_LIMIT_PER_HOUR="4"
+python scanner_v0.py --loop
+```
+
+## Paper Trading
+
+v0.6 includes simulated paper trading only. It never buys, sells, signs, or uses
+private keys.
+
+When a token is `SAFE` and passes the Telegram alert criteria, the scanner opens
+a paper trade in `paper_trades.json` with:
+
+- mint
+- symbol
+- entry price
+- entry time
+- liquidity at entry
+- source
+
+On each scan cycle, open paper trades are rechecked against DexScreener. The
+scanner tracks current PnL, max gain, and max drawdown. A paper trade closes
+automatically on:
+
+- take profit: `+50%`
+- stop loss: `-30%`
+- max hold time: `6 hours`
+
+Paper trade open and close messages are sent to Telegram when Telegram is
+configured, using the same hourly rate limit.
+
+Show paper trade stats:
+
+```powershell
+python scanner_v0.py --stats
+```
 
 ## Verdicts
 

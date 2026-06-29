@@ -3,3 +3,4 @@ __pycache__/
 .venv/
 .env
 .arlobit_alerts.json
+paper_trades.json
