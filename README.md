@@ -1,4 +1,4 @@
-# ArloBit Solana Scanner v0.4
+# ArloBit Solana Scanner v0.5
 
 Standalone terminal scanner for fresh Solana token pairs using the free
 DexScreener API.
@@ -28,12 +28,42 @@ python scanner_v0.py
 Optional:
 
 ```powershell
-python scanner_v0.py --limit 20 --max-age-hours 24 --candidate-limit 100
+python scanner_v0.py --once --limit 20 --max-age-hours 24 --candidate-limit 100
 ```
+
+`--once` runs a single scan cycle and exits. If neither `--once` nor `--loop` is
+provided, the scanner behaves like `--once`.
+
+## Loop Mode
+
+`--loop` runs continuously and scans every 3 minutes by default:
+
+```powershell
+python scanner_v0.py --loop
+```
+
+Use a custom interval in seconds:
+
+```powershell
+python scanner_v0.py --loop --interval 180
+```
+
+Recommended Windows PowerShell command:
+
+```powershell
+$env:UV_SYSTEM_CERTS="true"
+$env:TELEGRAM_BOT_TOKEN="123456789:your_bot_token"
+$env:TELEGRAM_CHAT_ID="123456789"
+$env:SOLANA_RPC_URL="https://api.mainnet-beta.solana.com"
+python scanner_v0.py --loop --interval 180
+```
+
+Stop loop mode with `Ctrl+C`. The scanner catches API/RPC failures per cycle,
+prints health output, and continues instead of exiting permanently.
 
 ## Data Sources
 
-v0.4 starts from fresh DexScreener Solana token candidates:
+v0.5 starts from fresh DexScreener Solana token candidates:
 
 - `GET /token-profiles/latest/v1`
 - `GET /token-boosts/latest/v1`
@@ -47,7 +77,7 @@ Pair age comes from `pairCreatedAt`. By default, rows are included when pair age
 is greater than 10 minutes and less than 24 hours. Missing `pairCreatedAt` is
 shown as `unknown` and scored as `RISKY`.
 
-v0.4 also checks the Solana mint account for each token:
+v0.5 also checks the Solana mint account for each token:
 
 - `getAccountInfo` on the token mint address
 - SPL Token Mint layout parsing from base64 account data
@@ -79,7 +109,8 @@ Telegram disabled: missing env vars
 Alerts are sent only for rows that are already `SAFE`, have `mint_auth=no`,
 have `freeze_auth=no`, and are between 10 minutes and 24 hours old. The scanner
 deduplicates alerts by mint in a run and keeps a local `.arlobit_alerts.json`
-state file to limit Telegram alerts to 2 per hour.
+state file to avoid alerting the same mint again across restarts. The same state
+file also limits Telegram alerts to 2 per hour.
 
 To create a Telegram bot:
 

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-ArloBit Solana Scanner v0.4
+ArloBit Solana Scanner v0.5
 
 Scans fresh Solana token profiles/boosts from the free DexScreener API,
 fetches pair details, filters by pairCreatedAt, and prints a compact
-terminal risk table. v0.4 adds optional Telegram alerts for SAFE tokens.
+terminal risk table. v0.5 adds persistent loop mode for automatic alerts.
 
 This script never trades and never loads private keys.
 """
@@ -38,6 +38,7 @@ TOKEN_PAIRS_URL = f"{BASE_URL}/token-pairs/v1/{{chain_id}}/{{token_address}}"
 DEFAULT_SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 TELEGRAM_STATE_FILE = ".arlobit_alerts.json"
+DEFAULT_LOOP_INTERVAL_SECONDS = 180
 
 DEFAULT_MIN_AGE_MINUTES = 10
 DEFAULT_MAX_AGE_HOURS = 24
@@ -82,6 +83,16 @@ class MintAuthorityStatus:
     mint_authority_active: bool | None
     freeze_authority_active: bool | None
     issue: str | None = None
+
+
+@dataclass(frozen=True)
+class ScanResult:
+    rows: list[PairRow]
+    issues: list[str]
+    candidate_count: int
+    pairs_scanned: int
+    safe_count: int
+    alerts_sent: int
 
 
 def number(value: Any, default: float = 0.0) -> float:
@@ -350,7 +361,7 @@ def collect_rows(
     max_age_hours: int,
     candidate_limit: int,
     rpc_url: str,
-) -> tuple[list[PairRow], list[str], int]:
+) -> tuple[list[PairRow], list[str], int, int]:
     candidates, issues = fetch_candidates(session, timeout)
     now_ms = int(time.time() * 1000)
     seen_pairs: set[str] = set()
@@ -362,6 +373,8 @@ def collect_rows(
         if mint_status is None:
             mint_status = fetch_mint_account(session, rpc_url, candidate.token_address, timeout)
             mint_cache[candidate.token_address] = mint_status
+            if mint_status.issue:
+                issues.append(f"rpc:{candidate.token_address}: {mint_status.issue}")
 
         try:
             pairs = fetch_token_pairs(session, candidate.token_address, timeout)
@@ -391,7 +404,7 @@ def collect_rows(
             -row.volume_5m,
         )
     )
-    return rows[:limit], issues, len(candidates)
+    return rows[:limit], issues, len(candidates), len(seen_pairs)
 
 
 def money(value: float) -> str:
@@ -499,7 +512,7 @@ def prune_telegram_state(state: dict[str, Any], now: float) -> dict[str, Any]:
     mints = {
         mint: stamp
         for mint, stamp in state.get("mints", {}).items()
-        if isinstance(mint, str) and isinstance(stamp, (int, float)) and stamp >= cutoff
+        if isinstance(mint, str) and isinstance(stamp, (int, float))
     }
     return {"sent_at": sent_at, "mints": mints}
 
@@ -606,6 +619,20 @@ def positive_int(value: str) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Scan fresh Solana pairs from DexScreener.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--once", action="store_true", help="run one scan cycle and exit")
+    mode.add_argument("--loop", action="store_true", help="run continuously until Ctrl+C")
+    parser.add_argument(
+        "--interval",
+        type=positive_int,
+        default=DEFAULT_LOOP_INTERVAL_SECONDS,
+        help="loop interval in seconds; used with --loop",
+    )
+    parser.add_argument(
+        "--cycles",
+        type=positive_int,
+        help="optional loop cycle limit, useful for local tests",
+    )
     parser.add_argument("--limit", type=positive_int, default=12, help="maximum rows to print")
     parser.add_argument("--timeout", type=positive_int, default=15, help="HTTP timeout in seconds")
     parser.add_argument("--min-age-minutes", type=positive_int, default=DEFAULT_MIN_AGE_MINUTES)
@@ -624,16 +651,31 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
-    if args.min_age_minutes >= args.max_age_hours * 60:
-        print("--min-age-minutes must be lower than --max-age-hours", file=sys.stderr)
-        return 2
-
+def build_session() -> requests.Session:
     session = requests.Session()
-    session.headers.update({"Accept": "application/json", "User-Agent": "ArloBit/0.4"})
+    session.headers.update({"Accept": "application/json", "User-Agent": "ArloBit/0.5"})
+    return session
 
-    rows, issues, candidate_count = collect_rows(
+
+def timestamp() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def print_health(result: ScanResult) -> None:
+    error_count = len(result.issues)
+    print(
+        "Health: "
+        f"pairs_scanned={result.pairs_scanned} "
+        f"candidates_found={result.candidate_count} "
+        f"safe_count={result.safe_count} "
+        f"alerts_sent={result.alerts_sent} "
+        f"api_rpc_errors={error_count}"
+    )
+
+
+def run_scan_once(args: argparse.Namespace) -> ScanResult:
+    session = build_session()
+    rows, issues, candidate_count, pairs_scanned = collect_rows(
         session=session,
         limit=args.limit,
         timeout=args.timeout,
@@ -645,7 +687,7 @@ def main() -> int:
 
     print(render_table(rows))
     print(f"\nScanned {candidate_count} latest Solana profile/boost candidates.")
-    _, telegram_issues = send_telegram_alerts(
+    alerts_sent, telegram_issues = send_telegram_alerts(
         session=session,
         rows=rows,
         timeout=args.timeout,
@@ -653,6 +695,15 @@ def main() -> int:
         max_age_hours=args.max_age_hours,
     )
     issues.extend(telegram_issues)
+    result = ScanResult(
+        rows=rows,
+        issues=issues,
+        candidate_count=candidate_count,
+        pairs_scanned=pairs_scanned,
+        safe_count=sum(1 for row in rows if row.verdict == "SAFE"),
+        alerts_sent=alerts_sent,
+    )
+    print_health(result)
 
     if issues:
         print("\nAPI issues:", file=sys.stderr)
@@ -664,7 +715,46 @@ def main() -> int:
             f"\nNo Solana pairs matched age > {args.min_age_minutes}m and < {args.max_age_hours}h.",
             file=sys.stderr,
         )
-        return 1
+    return result
+
+
+def run_loop(args: argparse.Namespace) -> int:
+    cycle = 0
+    print(f"ArloBit loop mode started. interval={args.interval}s. Press Ctrl+C to stop.")
+    try:
+        while True:
+            cycle += 1
+            print(f"\n[{timestamp()}] Scan cycle {cycle} start")
+            try:
+                run_scan_once(args)
+            except Exception as exc:
+                print(f"[{timestamp()}] Scan cycle {cycle} failed: {exc}", file=sys.stderr)
+                print("Health: pairs_scanned=0 candidates_found=0 safe_count=0 alerts_sent=0 api_rpc_errors=1")
+
+            if args.cycles and cycle >= args.cycles:
+                print(f"[{timestamp()}] Loop cycle limit reached; exiting.")
+                return 0
+
+            print(f"[{timestamp()}] Sleeping {args.interval}s before next scan.")
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print(f"\n[{timestamp()}] Ctrl+C received; stopping ArloBit loop.")
+        return 0
+
+
+def main() -> int:
+    args = parse_args()
+    if args.min_age_minutes >= args.max_age_hours * 60:
+        print("--min-age-minutes must be lower than --max-age-hours", file=sys.stderr)
+        return 2
+    if args.cycles and not args.loop:
+        print("--cycles can only be used with --loop", file=sys.stderr)
+        return 2
+
+    if args.loop:
+        return run_loop(args)
+
+    run_scan_once(args)
     return 0
 
 
