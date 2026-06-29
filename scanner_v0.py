@@ -67,7 +67,7 @@ RPC_429_BACKOFF_SECONDS = 1.0
 
 def load_dotenv(path: str = ".env") -> None:
     try:
-        with open(path, "r", encoding="utf-8") as handle:
+        with open(path, "r", encoding="utf-8-sig") as handle:
             lines = handle.readlines()
     except FileNotFoundError:
         return
@@ -77,10 +77,22 @@ def load_dotenv(path: str = ".env") -> None:
         if not stripped or stripped.startswith("#") or "=" not in stripped:
             continue
         key, value = stripped.split("=", 1)
-        key = key.strip()
+        key = key.strip().lstrip("\ufeff")
         value = value.strip().strip('"').strip("'")
         if key and key not in os.environ:
             os.environ[key] = value
+
+
+def masked_env_status(name: str) -> str:
+    value = os.environ.get(name)
+    if value:
+        return f"{name}: loaded (len={len(value)})"
+    return f"{name}: missing"
+
+
+def print_startup_env_status() -> None:
+    print(masked_env_status("TELEGRAM_BOT_TOKEN"))
+    print(masked_env_status("TELEGRAM_CHAT_ID"))
 
 
 @dataclass(frozen=True)
@@ -990,6 +1002,11 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument("--once", action="store_true", help="run one scan cycle and exit")
     mode.add_argument("--loop", action="store_true", help="run continuously until Ctrl+C")
     mode.add_argument("--stats", action="store_true", help="show paper trading stats and exit")
+    mode.add_argument(
+        "--test-paper-alert",
+        action="store_true",
+        help="send one Telegram paper-trade test message and exit",
+    )
     parser.add_argument(
         "--interval",
         type=positive_int,
@@ -1168,6 +1185,33 @@ def run_scan_once(args: argparse.Namespace) -> ScanResult:
     return result
 
 
+def run_test_paper_alert(args: argparse.Namespace) -> int:
+    session = build_session()
+    message = "\n".join(
+        [
+            "ArloBit PAPER trade test alert",
+            "Mode: simulated paper trade only",
+            "No trade was opened or executed.",
+        ]
+    )
+    sent, issues = send_telegram_messages(
+        session=session,
+        messages=[message],
+        timeout=args.timeout,
+        hourly_limit=args.telegram_limit,
+    )
+    print(f"Telegram paper test alerts sent: {sent}")
+    if issues:
+        print("Telegram test issues:", file=sys.stderr)
+        for issue in issues:
+            print(f"- {issue}", file=sys.stderr)
+        return 1
+    if sent != 1:
+        print("Telegram paper test alert was not sent", file=sys.stderr)
+        return 1
+    return 0
+
+
 def run_loop(args: argparse.Namespace) -> int:
     cycle = 0
     print(f"ArloBit loop mode started. interval={args.interval}s. Press Ctrl+C to stop.")
@@ -1194,6 +1238,7 @@ def run_loop(args: argparse.Namespace) -> int:
 
 def main() -> int:
     load_dotenv()
+    print_startup_env_status()
     args = parse_args()
     if args.min_age_minutes >= args.max_age_hours * 60:
         print("--min-age-minutes must be lower than --max-age-hours", file=sys.stderr)
@@ -1213,6 +1258,8 @@ def main() -> int:
     if args.stats:
         print(render_paper_stats())
         return 0
+    if args.test_paper_alert:
+        return run_test_paper_alert(args)
 
     run_scan_once(args)
     return 0
