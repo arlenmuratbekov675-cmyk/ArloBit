@@ -1,4 +1,4 @@
-# ArloBit Solana Scanner v0.6
+# ArloBit Solana Scanner v0.7
 
 Standalone terminal scanner for fresh Solana token pairs using the free
 DexScreener API.
@@ -63,7 +63,7 @@ prints health output, and continues instead of exiting permanently.
 
 ## Data Sources
 
-v0.6 starts from fresh DexScreener Solana token candidates:
+v0.7 starts from fresh DexScreener Solana token candidates:
 
 - `GET /token-profiles/latest/v1`
 - `GET /token-boosts/latest/v1`
@@ -77,12 +77,14 @@ Pair age comes from `pairCreatedAt`. By default, rows are included when pair age
 is greater than 10 minutes and less than 24 hours. Missing `pairCreatedAt` is
 shown as `unknown` and scored as `RISKY`.
 
-v0.6 also checks the Solana mint account for each token:
+v0.7 also checks the Solana mint account for each token:
 
 - `getAccountInfo` on the token mint address
 - SPL Token Mint layout parsing from base64 account data
 - `mint_auth` shows whether mint authority is still active
 - `freeze_auth` shows whether freeze authority is still active
+- `getAccountInfo` calls are spaced by 0.3-0.5s by default
+- HTTP 429 responses are retried once after a short backoff
 
 The default RPC is:
 
@@ -109,6 +111,18 @@ Telegram disabled: missing env vars
 The scanner auto-loads a local `.env` file at startup, so you can place
 `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and `SOLANA_RPC_URL` there instead of
 exporting them manually.
+
+SAFE scoring can also be tuned from `.env` or CLI:
+
+```powershell
+$env:SAFE_MIN_LIQUIDITY_USD="30000"
+$env:MIN_SAFE_VOLUME_LIQUIDITY_RATIO="0.01"
+$env:MAX_SAFE_VOLUME_LIQUIDITY_RATIO="1.0"
+$env:RPC_GET_ACCOUNT_INFO_MIN_DELAY_SECONDS="0.3"
+$env:RPC_GET_ACCOUNT_INFO_MAX_DELAY_SECONDS="0.5"
+$env:RPC_429_BACKOFF_SECONDS="1.0"
+python scanner_v0.py --once
+```
 
 Alerts are sent only for rows that are already `SAFE`, have `mint_auth=no`,
 have `freeze_auth=no`, and are between 10 minutes and 24 hours old. The scanner
@@ -148,7 +162,7 @@ python scanner_v0.py --loop
 
 ## Paper Trading
 
-v0.6 includes simulated paper trading only. It never buys, sells, signs, or uses
+v0.7 includes simulated paper trading only. It never buys, sells, signs, or uses
 private keys.
 
 When a token is `SAFE` and passes the Telegram alert criteria, the scanner opens
@@ -167,7 +181,8 @@ automatically on:
 
 - take profit: `+50%`
 - stop loss: `-30%`
-- max hold time: `6 hours`
+- rug: price drops at least `50%` from entry
+- timeout: `6 hours`
 
 Paper trade open and close messages are sent to Telegram when Telegram is
 configured, using the same hourly rate limit.
@@ -178,10 +193,14 @@ Show paper trade stats:
 python scanner_v0.py --stats
 ```
 
+Stats include an `exit reasons` breakdown for `take_profit`, `stop_loss`, `rug`,
+`timeout`, and `other`.
+
 ## Verdicts
 
-`SAFE` requires several conditions to pass, including fresh age, strong
-liquidity, useful 5-minute volume, non-anomalous volume/liquidity ratio, no
+`SAFE` requires several conditions to pass, including fresh age, at least
+`$30,000` liquidity by default, useful 5-minute volume, sane
+volume/liquidity ratio, no
 sharp 5-minute drawdown, inactive mint authority, and inactive freeze authority.
 
 `RISKY` is used for unclear or mixed data, including missing age, low liquidity,

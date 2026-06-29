@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-ArloBit Solana Scanner v0.6
+ArloBit Solana Scanner v0.7
 
 Scans fresh Solana token profiles/boosts from the free DexScreener API,
 fetches pair details, filters by pairCreatedAt, and prints a compact
-terminal risk table. v0.6 adds simulated paper trading.
+terminal risk table. v0.7 tightens SAFE scoring, improves RPC stability,
+and adds stronger paper-trade loss protection.
 
 This script never trades and never loads private keys.
 """
@@ -15,6 +16,7 @@ import argparse
 import base64
 import json
 import os
+import random
 import sys
 import time
 from dataclasses import dataclass
@@ -46,16 +48,21 @@ DEFAULT_MAX_AGE_HOURS = 24
 DEFAULT_TELEGRAM_ALERT_LIMIT_PER_HOUR = 2
 PAPER_TAKE_PROFIT_PERCENT = 50
 PAPER_STOP_LOSS_PERCENT = -30
+PAPER_RUG_DROP_PERCENT = -50
 PAPER_MAX_HOLD_SECONDS = 6 * 60 * 60
-SAFE_MIN_LIQUIDITY_USD = 20_000
+SAFE_MIN_LIQUIDITY_USD = 30_000
 SAFE_MIN_VOLUME_5M = 5_000
 VERY_LOW_LIQUIDITY_USD = 1_000
 LOW_LIQUIDITY_USD = 5_000
+MIN_SAFE_VOLUME_LIQUIDITY_RATIO = 0.01
 MAX_SAFE_VOLUME_LIQUIDITY_RATIO = 1.0
 ANOMALY_VOLUME_LIQUIDITY_RATIO = 2.0
 MIN_SAFE_PRICE_CHANGE_5M = -30
 EXTREME_PUMP_5M = 150
 SPL_MINT_ACCOUNT_MIN_SIZE = 82
+RPC_GET_ACCOUNT_INFO_MIN_DELAY_SECONDS = 0.3
+RPC_GET_ACCOUNT_INFO_MAX_DELAY_SECONDS = 0.5
+RPC_429_BACKOFF_SECONDS = 1.0
 
 
 def load_dotenv(path: str = ".env") -> None:
@@ -147,6 +154,7 @@ def fetch_mint_account(
     rpc_url: str,
     token_address: str,
     timeout: int,
+    retry_backoff: float = RPC_429_BACKOFF_SECONDS,
 ) -> MintAuthorityStatus:
     payload = {
         "jsonrpc": "2.0",
@@ -158,12 +166,24 @@ def fetch_mint_account(
         ],
     }
 
-    try:
-        response = session.post(rpc_url, json=payload, timeout=timeout)
-        response.raise_for_status()
-        rpc_payload = response.json()
-    except (requests.RequestException, ValueError) as exc:
-        return MintAuthorityStatus(None, None, f"rpc_failed:{exc}")
+    last_error: str | None = None
+    for attempt in range(2):
+        try:
+            response = session.post(rpc_url, json=payload, timeout=timeout)
+            if response.status_code == 429:
+                last_error = "rpc_429"
+                if attempt == 0:
+                    time.sleep(retry_backoff)
+                    continue
+                return MintAuthorityStatus(None, None, last_error)
+            response.raise_for_status()
+            rpc_payload = response.json()
+            break
+        except (requests.RequestException, ValueError) as exc:
+            last_error = f"rpc_failed:{exc}"
+            return MintAuthorityStatus(None, None, last_error)
+    else:
+        return MintAuthorityStatus(None, None, last_error or "rpc_failed")
 
     if rpc_payload.get("error"):
         message = rpc_payload["error"].get("message", "unknown")
@@ -286,6 +306,9 @@ def score_pair(
     age_minutes: float | None,
     price_change_5m: float,
     mint_status: MintAuthorityStatus,
+    safe_min_liquidity_usd: float = SAFE_MIN_LIQUIDITY_USD,
+    min_safe_volume_liquidity_ratio: float = MIN_SAFE_VOLUME_LIQUIDITY_RATIO,
+    max_safe_volume_liquidity_ratio: float = MAX_SAFE_VOLUME_LIQUIDITY_RATIO,
 ) -> tuple[str, tuple[str, ...]]:
     danger: list[str] = []
     risk: list[str] = []
@@ -304,7 +327,7 @@ def score_pair(
         danger.append("very_low_liq")
     elif liquidity < LOW_LIQUIDITY_USD:
         risk.append("low_liq")
-    elif liquidity > SAFE_MIN_LIQUIDITY_USD:
+    elif liquidity >= safe_min_liquidity_usd:
         pass_count += 1
     else:
         risk.append("weak_liq")
@@ -319,8 +342,10 @@ def score_pair(
     volume_liquidity_ratio = volume_5m / liquidity if liquidity > 0 else float("inf")
     if volume_liquidity_ratio >= ANOMALY_VOLUME_LIQUIDITY_RATIO:
         danger.append("vol_liq_anomaly")
-    elif volume_liquidity_ratio > MAX_SAFE_VOLUME_LIQUIDITY_RATIO:
+    elif volume_liquidity_ratio > max_safe_volume_liquidity_ratio:
         risk.append("high_vol_liq")
+    elif volume_liquidity_ratio < min_safe_volume_liquidity_ratio:
+        risk.append("low_vol_liq")
     else:
         pass_count += 1
 
@@ -328,7 +353,7 @@ def score_pair(
         danger.append("crash_5m")
     elif price_change_5m <= MIN_SAFE_PRICE_CHANGE_5M:
         danger.append("drop_5m")
-    elif price_change_5m >= EXTREME_PUMP_5M and liquidity < SAFE_MIN_LIQUIDITY_USD:
+    elif price_change_5m >= EXTREME_PUMP_5M and liquidity < safe_min_liquidity_usd:
         danger.append("pump_weak_liq")
     else:
         pass_count += 1
@@ -362,13 +387,25 @@ def to_row(
     candidate: Candidate,
     now_ms: int,
     mint_status: MintAuthorityStatus,
+    safe_min_liquidity_usd: float,
+    min_safe_volume_liquidity_ratio: float,
+    max_safe_volume_liquidity_ratio: float,
 ) -> PairRow:
     token = base_token_for_candidate(pair, candidate.token_address)
     liquidity = number((pair.get("liquidity") or {}).get("usd"))
     volume_5m = number((pair.get("volume") or {}).get("m5"))
     price_change_5m = number((pair.get("priceChange") or {}).get("m5"))
     age_minutes = pair_age_minutes(pair, now_ms)
-    verdict, signals = score_pair(liquidity, volume_5m, age_minutes, price_change_5m, mint_status)
+    verdict, signals = score_pair(
+        liquidity,
+        volume_5m,
+        age_minutes,
+        price_change_5m,
+        mint_status,
+        safe_min_liquidity_usd,
+        min_safe_volume_liquidity_ratio,
+        max_safe_volume_liquidity_ratio,
+    )
 
     return PairRow(
         token_address=candidate.token_address,
@@ -396,17 +433,33 @@ def collect_rows(
     max_age_hours: int,
     candidate_limit: int,
     rpc_url: str,
+    safe_min_liquidity_usd: float,
+    min_safe_volume_liquidity_ratio: float,
+    max_safe_volume_liquidity_ratio: float,
+    rpc_min_delay: float,
+    rpc_max_delay: float,
+    rpc_429_backoff: float,
 ) -> tuple[list[PairRow], list[str], int, int]:
     candidates, issues = fetch_candidates(session, timeout)
     now_ms = int(time.time() * 1000)
     seen_pairs: set[str] = set()
     mint_cache: dict[str, MintAuthorityStatus] = {}
     rows: list[PairRow] = []
+    rpc_calls = 0
 
     for candidate in candidates[:candidate_limit]:
         mint_status = mint_cache.get(candidate.token_address)
         if mint_status is None:
-            mint_status = fetch_mint_account(session, rpc_url, candidate.token_address, timeout)
+            if rpc_calls > 0:
+                time.sleep(random.uniform(rpc_min_delay, rpc_max_delay))
+            mint_status = fetch_mint_account(
+                session,
+                rpc_url,
+                candidate.token_address,
+                timeout,
+                rpc_429_backoff,
+            )
+            rpc_calls += 1
             mint_cache[candidate.token_address] = mint_status
             if mint_status.issue:
                 issues.append(f"rpc:{candidate.token_address}: {mint_status.issue}")
@@ -423,7 +476,15 @@ def collect_rows(
                 continue
             seen_pairs.add(pair_address)
 
-            row = to_row(pair, candidate, now_ms, mint_status)
+            row = to_row(
+                pair,
+                candidate,
+                now_ms,
+                mint_status,
+                safe_min_liquidity_usd,
+                min_safe_volume_liquidity_ratio,
+                max_safe_volume_liquidity_ratio,
+            )
             if row.age_minutes is None:
                 rows.append(row)
                 continue
@@ -621,10 +682,12 @@ def update_open_paper_trades(
         exit_reason = None
         if pnl >= PAPER_TAKE_PROFIT_PERCENT:
             exit_reason = "take_profit"
+        elif pnl <= PAPER_RUG_DROP_PERCENT:
+            exit_reason = "rug"
         elif pnl <= PAPER_STOP_LOSS_PERCENT:
             exit_reason = "stop_loss"
         elif entry_time > 0 and now - entry_time >= PAPER_MAX_HOLD_SECONDS:
-            exit_reason = "max_hold_time"
+            exit_reason = "timeout"
 
         if exit_reason:
             trade["status"] = "closed"
@@ -863,6 +926,20 @@ def render_paper_stats() -> str:
     best = max(final_pnls) if final_pnls else 0.0
     worst = min(final_pnls) if final_pnls else 0.0
     total_pnl = sum(final_pnls)
+    exit_reasons = {
+        "take_profit": 0,
+        "stop_loss": 0,
+        "rug": 0,
+        "timeout": 0,
+        "other": 0,
+    }
+    for trade in closed:
+        reason = str(trade.get("exit_reason") or "other")
+        if reason == "max_hold_time":
+            reason = "timeout"
+        if reason not in exit_reasons:
+            reason = "other"
+        exit_reasons[reason] += 1
 
     return "\n".join(
         [
@@ -876,6 +953,12 @@ def render_paper_stats() -> str:
             f"best: {best:.2f}%",
             f"worst: {worst:.2f}%",
             f"total simulated pnl: {total_pnl:.2f}%",
+            "exit reasons:",
+            f"  take_profit: {exit_reasons['take_profit']}",
+            f"  stop_loss: {exit_reasons['stop_loss']}",
+            f"  rug: {exit_reasons['rug']}",
+            f"  timeout: {exit_reasons['timeout']}",
+            f"  other: {exit_reasons['other']}",
         ]
     )
 
@@ -884,6 +967,20 @@ def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def nonnegative_float(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
     return parsed
 
 
@@ -920,6 +1017,50 @@ def parse_args() -> argparse.Namespace:
         help="Solana RPC URL; defaults to SOLANA_RPC_URL env var or public mainnet RPC",
     )
     parser.add_argument(
+        "--safe-min-liquidity-usd",
+        type=positive_float,
+        default=positive_float(os.environ.get("SAFE_MIN_LIQUIDITY_USD", str(SAFE_MIN_LIQUIDITY_USD))),
+        help="minimum liquidity in USD required for SAFE",
+    )
+    parser.add_argument(
+        "--min-safe-volume-liquidity-ratio",
+        type=nonnegative_float,
+        default=nonnegative_float(
+            os.environ.get("MIN_SAFE_VOLUME_LIQUIDITY_RATIO", str(MIN_SAFE_VOLUME_LIQUIDITY_RATIO))
+        ),
+        help="minimum volume_5m/liquidity_usd ratio required for SAFE",
+    )
+    parser.add_argument(
+        "--max-safe-volume-liquidity-ratio",
+        type=positive_float,
+        default=positive_float(
+            os.environ.get("MAX_SAFE_VOLUME_LIQUIDITY_RATIO", str(MAX_SAFE_VOLUME_LIQUIDITY_RATIO))
+        ),
+        help="maximum volume_5m/liquidity_usd ratio allowed for SAFE",
+    )
+    parser.add_argument(
+        "--rpc-min-delay",
+        type=nonnegative_float,
+        default=nonnegative_float(
+            os.environ.get("RPC_GET_ACCOUNT_INFO_MIN_DELAY_SECONDS", str(RPC_GET_ACCOUNT_INFO_MIN_DELAY_SECONDS))
+        ),
+        help="minimum delay between Solana getAccountInfo RPC calls",
+    )
+    parser.add_argument(
+        "--rpc-max-delay",
+        type=nonnegative_float,
+        default=nonnegative_float(
+            os.environ.get("RPC_GET_ACCOUNT_INFO_MAX_DELAY_SECONDS", str(RPC_GET_ACCOUNT_INFO_MAX_DELAY_SECONDS))
+        ),
+        help="maximum delay between Solana getAccountInfo RPC calls",
+    )
+    parser.add_argument(
+        "--rpc-429-backoff",
+        type=nonnegative_float,
+        default=nonnegative_float(os.environ.get("RPC_429_BACKOFF_SECONDS", str(RPC_429_BACKOFF_SECONDS))),
+        help="backoff before one retry after Solana RPC 429",
+    )
+    parser.add_argument(
         "--telegram-limit",
         type=positive_int,
         default=positive_int(os.environ.get("TELEGRAM_ALERT_LIMIT_PER_HOUR", str(DEFAULT_TELEGRAM_ALERT_LIMIT_PER_HOUR))),
@@ -930,7 +1071,7 @@ def parse_args() -> argparse.Namespace:
 
 def build_session() -> requests.Session:
     session = requests.Session()
-    session.headers.update({"Accept": "application/json", "User-Agent": "ArloBit/0.5"})
+    session.headers.update({"Accept": "application/json", "User-Agent": "ArloBit/0.7"})
     return session
 
 
@@ -970,6 +1111,12 @@ def run_scan_once(args: argparse.Namespace) -> ScanResult:
         max_age_hours=args.max_age_hours,
         candidate_limit=args.candidate_limit,
         rpc_url=args.rpc_url,
+        safe_min_liquidity_usd=args.safe_min_liquidity_usd,
+        min_safe_volume_liquidity_ratio=args.min_safe_volume_liquidity_ratio,
+        max_safe_volume_liquidity_ratio=args.max_safe_volume_liquidity_ratio,
+        rpc_min_delay=args.rpc_min_delay,
+        rpc_max_delay=args.rpc_max_delay,
+        rpc_429_backoff=args.rpc_429_backoff,
     )
 
     print(render_table(rows))
@@ -1053,6 +1200,12 @@ def main() -> int:
         return 2
     if args.cycles and not args.loop:
         print("--cycles can only be used with --loop", file=sys.stderr)
+        return 2
+    if args.min_safe_volume_liquidity_ratio > args.max_safe_volume_liquidity_ratio:
+        print("--min-safe-volume-liquidity-ratio must be <= --max-safe-volume-liquidity-ratio", file=sys.stderr)
+        return 2
+    if args.rpc_min_delay > args.rpc_max_delay:
+        print("--rpc-min-delay must be <= --rpc-max-delay", file=sys.stderr)
         return 2
 
     if args.loop:
