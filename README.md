@@ -1,4 +1,4 @@
-# ArloBit Solana Scanner v0.7.1
+# ArloBit Solana Scanner v0.7.2
 
 Standalone terminal scanner for fresh Solana token pairs using the free
 DexScreener API.
@@ -63,7 +63,7 @@ prints health output, and continues instead of exiting permanently.
 
 ## Data Sources
 
-v0.7.1 starts from fresh DexScreener Solana token candidates:
+v0.7.2 starts from fresh DexScreener Solana token candidates:
 
 - `GET /token-profiles/latest/v1`
 - `GET /token-boosts/latest/v1`
@@ -77,7 +77,7 @@ Pair age comes from `pairCreatedAt`. By default, rows are included when pair age
 is greater than 10 minutes and less than 24 hours. Missing `pairCreatedAt` is
 shown as `unknown` and scored as `RISKY`.
 
-v0.7.1 also checks the Solana mint account for each token:
+v0.7.2 also checks the Solana mint account for each token:
 
 - `getAccountInfo` on the token mint address
 - SPL Token Mint layout parsing from base64 account data
@@ -115,9 +115,9 @@ exporting them manually.
 SAFE scoring can also be tuned from `.env` or CLI:
 
 ```powershell
-$env:SAFE_MIN_LIQUIDITY_USD="30000"
-$env:MIN_SAFE_VOLUME_LIQUIDITY_RATIO="0.01"
-$env:MAX_SAFE_VOLUME_LIQUIDITY_RATIO="1.0"
+$env:SAFE_MIN_LIQUIDITY_USD="50000"
+$env:MIN_SAFE_VOLUME_LIQUIDITY_RATIO="0.10"
+$env:MAX_SAFE_VOLUME_LIQUIDITY_RATIO="0.50"
 $env:RPC_GET_ACCOUNT_INFO_MIN_DELAY_SECONDS="0.3"
 $env:RPC_GET_ACCOUNT_INFO_MAX_DELAY_SECONDS="0.5"
 $env:RPC_429_BACKOFF_SECONDS="1.0"
@@ -125,7 +125,8 @@ python scanner_v0.py --once
 ```
 
 Alerts are sent only for rows that are already `SAFE`, have `mint_auth=no`,
-have `freeze_auth=no`, and are between 10 minutes and 24 hours old. The scanner
+have `freeze_auth=no`, and are between 10 minutes and 24 hours old. In v0.7.2,
+`SAFE` requires token age of at least 30 minutes. The scanner
 deduplicates alerts by mint in a run and keeps a local `.arlobit_alerts.json`
 state file to avoid alerting the same mint again across restarts. The same state
 file also limits Telegram alerts to 2 per hour.
@@ -162,11 +163,12 @@ python scanner_v0.py --loop
 
 ## Paper Trading
 
-v0.7.1 includes simulated paper trading only. It never buys, sells, signs, or uses
+v0.7.2 includes simulated paper trading only. It never buys, sells, signs, or uses
 private keys.
 
-When a token is `SAFE` and passes the Telegram alert criteria, the scanner opens
-a paper trade in `paper_trades.json` with:
+When a token is `SAFE`, passes the Telegram alert criteria, and passes the
+v0.7.2 paper-entry gate, the scanner opens a paper trade in
+`paper_trades.json` with:
 
 - entry price
 - entry time
@@ -183,6 +185,16 @@ a paper trade in `paper_trades.json` with:
 - signals, risk signals, and danger signals
 - risk and danger counts
 - entry verdict
+
+The v0.7.2 paper-entry gate requires:
+
+- token age at least `30` minutes
+- liquidity at least `$50,000`
+- `volume_5m / liquidity_usd` from `0.10` through `0.50`
+
+Blocked paper-entry reasons are counted as `too_young`,
+`liquidity_too_low`, `vol_liq_too_high`, and `vol_liq_too_low` in health output
+and paper stats.
 
 On each scan cycle, open paper trades are rechecked against DexScreener. The
 scanner tracks current PnL, max gain, and max drawdown. A paper trade closes
@@ -228,9 +240,9 @@ on v0.7.1 metadata.
 
 ## Verdicts
 
-`SAFE` requires several conditions to pass, including fresh age, at least
-`$30,000` liquidity by default, useful 5-minute volume, sane
-volume/liquidity ratio, no
+`SAFE` requires several conditions to pass, including age of at least
+`30` minutes, at least `$50,000` liquidity by default, useful 5-minute volume,
+`volume_5m / liquidity_usd` from `0.10` through `0.50`, no
 sharp 5-minute drawdown, inactive mint authority, and inactive freeze authority.
 
 `RISKY` is used for unclear or mixed data, including missing age, low liquidity,

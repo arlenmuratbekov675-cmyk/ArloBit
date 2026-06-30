@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-ArloBit Solana Scanner v0.7.1
+ArloBit Solana Scanner v0.7.2
 
 Scans fresh Solana token profiles/boosts from the free DexScreener API,
 fetches pair details, filters by pairCreatedAt, and prints a compact
-terminal risk table. v0.7.1 improves paper-trade metadata for debug stats.
+terminal risk table. v0.7.2 tightens SAFE and paper-entry filters.
 
 This script never trades and never loads private keys.
 """
@@ -51,13 +51,15 @@ PAPER_TAKE_PROFIT_PERCENT = 50
 PAPER_STOP_LOSS_PERCENT = -30
 PAPER_RUG_DROP_PERCENT = -50
 PAPER_MAX_HOLD_SECONDS = 6 * 60 * 60
-SAFE_MIN_LIQUIDITY_USD = 30_000
+SAFE_MIN_AGE_MINUTES = 30
+SAFE_MIN_LIQUIDITY_USD = 50_000
 SAFE_MIN_VOLUME_5M = 5_000
 VERY_LOW_LIQUIDITY_USD = 1_000
 LOW_LIQUIDITY_USD = 5_000
-MIN_SAFE_VOLUME_LIQUIDITY_RATIO = 0.01
-MAX_SAFE_VOLUME_LIQUIDITY_RATIO = 1.0
+MIN_SAFE_VOLUME_LIQUIDITY_RATIO = 0.10
+MAX_SAFE_VOLUME_LIQUIDITY_RATIO = 0.50
 ANOMALY_VOLUME_LIQUIDITY_RATIO = 2.0
+BLOCKED_PAPER_REASONS = ("too_young", "liquidity_too_low", "vol_liq_too_high", "vol_liq_too_low")
 MIN_SAFE_PRICE_CHANGE_5M = -30
 EXTREME_PUMP_5M = 150
 SPL_MINT_ACCOUNT_MIN_SIZE = 82
@@ -137,6 +139,7 @@ class ScanResult:
     alerts_sent: int
     paper_opened: int
     paper_closed: int
+    blocked_paper_reason_counts: dict[str, int]
 
 
 def number(value: Any, default: float = 0.0) -> float:
@@ -329,7 +332,7 @@ def score_pair(
 
     if age_minutes is None:
         risk.append("missing_age")
-    elif age_minutes <= DEFAULT_MIN_AGE_MINUTES:
+    elif age_minutes < SAFE_MIN_AGE_MINUTES:
         risk.append("too_new")
     elif age_minutes < DEFAULT_MAX_AGE_HOURS * 60:
         pass_count += 1
@@ -577,6 +580,33 @@ def should_alert(row: PairRow, min_age_minutes: int, max_age_hours: int) -> bool
     return min_age_minutes < row.age_minutes < max_age_hours * 60
 
 
+def empty_blocked_paper_reason_counts() -> dict[str, int]:
+    return {reason: 0 for reason in BLOCKED_PAPER_REASONS}
+
+
+def paper_entry_blocked_reasons(row: PairRow) -> list[str]:
+    reasons: list[str] = []
+    if row.age_minutes is None or row.age_minutes < SAFE_MIN_AGE_MINUTES:
+        reasons.append("too_young")
+    if row.liquidity < SAFE_MIN_LIQUIDITY_USD:
+        reasons.append("liquidity_too_low")
+
+    volume_liquidity_ratio = row.volume_5m / row.liquidity if row.liquidity > 0 else float("inf")
+    if volume_liquidity_ratio > MAX_SAFE_VOLUME_LIQUIDITY_RATIO:
+        reasons.append("vol_liq_too_high")
+    elif volume_liquidity_ratio < MIN_SAFE_VOLUME_LIQUIDITY_RATIO:
+        reasons.append("vol_liq_too_low")
+    return reasons
+
+
+def count_blocked_paper_reasons(rows: list[PairRow]) -> dict[str, int]:
+    counts = empty_blocked_paper_reason_counts()
+    for row in rows:
+        for reason in paper_entry_blocked_reasons(row):
+            counts[reason] += 1
+    return counts
+
+
 def telegram_message(row: PairRow) -> str:
     return "\n".join(
         [
@@ -801,15 +831,37 @@ def update_open_paper_trades(
     return closed, issues, messages
 
 
-def open_paper_trades(rows: list[PairRow], min_age_minutes: int, max_age_hours: int) -> tuple[int, list[str]]:
+def merge_blocked_paper_reason_counts(
+    existing: dict[str, Any] | None,
+    increment: dict[str, int],
+) -> dict[str, int]:
+    merged = empty_blocked_paper_reason_counts()
+    if isinstance(existing, dict):
+        for reason in BLOCKED_PAPER_REASONS:
+            merged[reason] = int(number(existing.get(reason)))
+    for reason, count in increment.items():
+        if reason in merged:
+            merged[reason] += count
+    return merged
+
+
+def open_paper_trades(
+    rows: list[PairRow],
+    min_age_minutes: int,
+    max_age_hours: int,
+) -> tuple[int, list[str], dict[str, int]]:
     state = load_paper_trades()
     existing_mints = all_trade_mints(state)
+    blocked_reason_counts = count_blocked_paper_reasons(rows)
     opened = 0
     messages: list[str] = []
     now = time.time()
 
     for row in rows:
         if not should_alert(row, min_age_minutes, max_age_hours):
+            continue
+        blocked_reasons = paper_entry_blocked_reasons(row)
+        if blocked_reasons:
             continue
         if row.token_address in existing_mints:
             continue
@@ -834,9 +886,13 @@ def open_paper_trades(rows: list[PairRow], min_age_minutes: int, max_age_hours: 
         opened += 1
         messages.append(paper_open_message(trade))
 
-    if opened:
+    state["blocked_paper_reason_counts"] = merge_blocked_paper_reason_counts(
+        state.get("blocked_paper_reason_counts"),
+        blocked_reason_counts,
+    )
+    if opened or any(blocked_reason_counts.values()):
         save_paper_trades(state)
-    return opened, messages
+    return opened, messages, blocked_reason_counts
 
 
 def update_and_save_paper_trades(
@@ -1232,7 +1288,12 @@ def export_paper_trades_csv(path: str = PAPER_TRADES_CSV_FILE) -> int:
 
 
 def render_paper_stats() -> str:
-    trades = [trade for trade in load_paper_trades().get("trades", []) if isinstance(trade, dict)]
+    state = load_paper_trades()
+    trades = [trade for trade in state.get("trades", []) if isinstance(trade, dict)]
+    blocked_counts = merge_blocked_paper_reason_counts(
+        state.get("blocked_paper_reason_counts"),
+        empty_blocked_paper_reason_counts(),
+    )
     total = len(trades)
     open_count = sum(1 for trade in trades if trade.get("status") == "open")
     closed = [trade for trade in trades if trade.get("status") == "closed"]
@@ -1265,6 +1326,8 @@ def render_paper_stats() -> str:
         f"best: {best:.2f}%",
         f"worst: {worst:.2f}%",
         f"total simulated pnl: {total_pnl:.2f}%",
+        "blocked_paper_reason counts:",
+        *[f"  {reason}: {blocked_counts[reason]}" for reason in BLOCKED_PAPER_REASONS],
         "",
         *render_summary_table("PnL by exit_reason", grouped_trade_summaries(closed, normalized_exit_reason)),
         "",
@@ -1411,6 +1474,10 @@ def timestamp() -> str:
 
 def print_health(result: ScanResult) -> None:
     error_count = len(result.issues)
+    blocked_counts = " ".join(
+        f"blocked_paper_{reason}={result.blocked_paper_reason_counts.get(reason, 0)}"
+        for reason in BLOCKED_PAPER_REASONS
+    )
     print(
         "Health: "
         f"pairs_scanned={result.pairs_scanned} "
@@ -1419,6 +1486,7 @@ def print_health(result: ScanResult) -> None:
         f"alerts_sent={result.alerts_sent} "
         f"paper_opened={result.paper_opened} "
         f"paper_closed={result.paper_closed} "
+        f"{blocked_counts} "
         f"api_rpc_errors={error_count}"
     )
 
@@ -1460,7 +1528,11 @@ def run_scan_once(args: argparse.Namespace) -> ScanResult:
         hourly_limit=args.telegram_limit,
     )
     issues.extend(telegram_issues)
-    paper_opened, paper_open_messages = open_paper_trades(rows, args.min_age_minutes, args.max_age_hours)
+    paper_opened, paper_open_messages, blocked_paper_reason_counts = open_paper_trades(
+        rows,
+        args.min_age_minutes,
+        args.max_age_hours,
+    )
     paper_open_alerts, paper_open_alert_issues = send_telegram_messages(
         session=session,
         messages=paper_open_messages,
@@ -1482,6 +1554,7 @@ def run_scan_once(args: argparse.Namespace) -> ScanResult:
         alerts_sent=alerts_sent + paper_alerts_sent,
         paper_opened=paper_opened,
         paper_closed=paper_closed,
+        blocked_paper_reason_counts=blocked_paper_reason_counts,
     )
     print_health(result)
 
