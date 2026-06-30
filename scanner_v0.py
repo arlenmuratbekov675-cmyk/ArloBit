@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-ArloBit Solana Scanner v0.7.2
+ArloBit Solana Scanner v0.8
 
 Scans fresh Solana token profiles/boosts from the free DexScreener API,
 fetches pair details, filters by pairCreatedAt, and prints a compact
-terminal risk table. v0.7.2 tightens SAFE and paper-entry filters.
+terminal risk table. v0.8 adds Jupiter quote-only sellability checks.
 
 This script never trades and never loads private keys.
 """
@@ -19,7 +19,7 @@ import os
 import random
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 try:
@@ -38,11 +38,15 @@ PROFILE_URL = f"{BASE_URL}/token-profiles/latest/v1"
 BOOSTS_URL = f"{BASE_URL}/token-boosts/latest/v1"
 TOKEN_PAIRS_URL = f"{BASE_URL}/token-pairs/v1/{{chain_id}}/{{token_address}}"
 DEFAULT_SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
+JUPITER_QUOTE_URL = "https://lite-api.jup.ag/swap/v1/quote"
+SOL_MINT = "So11111111111111111111111111111111111111112"
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 TELEGRAM_STATE_FILE = ".arlobit_alerts.json"
 PAPER_TRADES_FILE = "paper_trades.json"
 PAPER_TRADES_CSV_FILE = "paper_trades.csv"
 DEFAULT_LOOP_INTERVAL_SECONDS = 180
+DEFAULT_JUPITER_SELL_AMOUNT_RAW = 1_000_000
 
 DEFAULT_MIN_AGE_MINUTES = 10
 DEFAULT_MAX_AGE_HOURS = 24
@@ -59,7 +63,15 @@ LOW_LIQUIDITY_USD = 5_000
 MIN_SAFE_VOLUME_LIQUIDITY_RATIO = 0.10
 MAX_SAFE_VOLUME_LIQUIDITY_RATIO = 0.50
 ANOMALY_VOLUME_LIQUIDITY_RATIO = 2.0
-BLOCKED_PAPER_REASONS = ("too_young", "liquidity_too_low", "vol_liq_too_high", "vol_liq_too_low")
+BLOCKED_PAPER_REASONS = (
+    "too_young",
+    "liquidity_too_low",
+    "vol_liq_too_high",
+    "vol_liq_too_low",
+    "honeypot_no_route",
+    "sell_impact_too_high",
+    "sellability_unknown",
+)
 MIN_SAFE_PRICE_CHANGE_5M = -30
 EXTREME_PUMP_5M = 150
 SPL_MINT_ACCOUNT_MIN_SIZE = 82
@@ -117,9 +129,22 @@ class PairRow:
     price_change_5m: float
     mint_authority_active: bool | None
     freeze_authority_active: bool | None
+    sellable: str
+    sell_price_impact_pct: float | None
+    sell_route_found: bool
+    sell_check_error: str | None
     verdict: str
     signals: tuple[str, ...]
     source: str
+
+
+@dataclass(frozen=True)
+class SellabilityStatus:
+    sellable: str = "unknown"
+    price_impact_pct: float | None = None
+    route_found: bool = False
+    error: str | None = None
+    output_mint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -286,6 +311,99 @@ def fetch_current_price(session: requests.Session, token_address: str, timeout: 
     return price_usd
 
 
+def route_found_in_quote(payload: dict[str, Any]) -> bool:
+    route_plan = payload.get("routePlan")
+    if isinstance(route_plan, list) and route_plan:
+        return True
+    return number(payload.get("outAmount")) > 0
+
+
+def jupiter_price_impact_pct(value: Any) -> float:
+    impact = number(value)
+    if 0 <= impact <= 1:
+        return impact * 100
+    return impact
+
+
+def is_jupiter_no_route(payload: dict[str, Any]) -> bool:
+    values = [
+        str(payload.get("error") or ""),
+        str(payload.get("errorCode") or ""),
+        str(payload.get("message") or ""),
+    ]
+    text = " ".join(values).lower()
+    return "route" in text and any(term in text for term in ("not found", "could not", "no "))
+
+
+def fetch_jupiter_quote(
+    session: requests.Session,
+    input_mint: str,
+    output_mint: str,
+    amount_raw: int,
+    timeout: int,
+) -> tuple[dict[str, Any] | None, str | None, bool]:
+    params = {
+        "inputMint": input_mint,
+        "outputMint": output_mint,
+        "amount": str(max(1, amount_raw)),
+        "slippageBps": "500",
+    }
+    try:
+        response = session.get(JUPITER_QUOTE_URL, params=params, timeout=timeout)
+    except requests.RequestException as exc:
+        return None, f"jupiter_request_failed:{exc}", False
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+
+    if response.ok and isinstance(payload, dict):
+        return payload, None, False
+    if isinstance(payload, dict) and is_jupiter_no_route(payload):
+        return None, "no_route", True
+    return None, f"jupiter_http_{response.status_code}", False
+
+
+def check_sellability(
+    session: requests.Session,
+    token_address: str,
+    timeout: int,
+    amount_raw: int = DEFAULT_JUPITER_SELL_AMOUNT_RAW,
+) -> SellabilityStatus:
+    errors: list[str] = []
+    no_route_seen = False
+
+    for output_mint in (SOL_MINT, USDC_MINT):
+        if token_address == output_mint:
+            continue
+        payload, error, no_route = fetch_jupiter_quote(
+            session=session,
+            input_mint=token_address,
+            output_mint=output_mint,
+            amount_raw=amount_raw,
+            timeout=timeout,
+        )
+        if payload and route_found_in_quote(payload):
+            return SellabilityStatus(
+                sellable="yes",
+                price_impact_pct=jupiter_price_impact_pct(payload.get("priceImpactPct")),
+                route_found=True,
+                output_mint=output_mint,
+            )
+        if no_route:
+            no_route_seen = True
+            continue
+        if error:
+            errors.append(error)
+
+    if errors:
+        return SellabilityStatus(sellable="unknown", error=";".join(errors))
+    if no_route_seen:
+        return SellabilityStatus(sellable="no", route_found=False, error="no_route")
+    return SellabilityStatus(sellable="unknown", error="no_quote_result")
+
+
 def pair_age_minutes(pair: dict[str, Any], now_ms: int) -> float | None:
     created_at = pair.get("pairCreatedAt")
     if created_at is None:
@@ -322,6 +440,7 @@ def score_pair(
     age_minutes: float | None,
     price_change_5m: float,
     mint_status: MintAuthorityStatus,
+    sellability: SellabilityStatus | None = None,
     safe_min_liquidity_usd: float = SAFE_MIN_LIQUIDITY_USD,
     min_safe_volume_liquidity_ratio: float = MIN_SAFE_VOLUME_LIQUIDITY_RATIO,
     max_safe_volume_liquidity_ratio: float = MAX_SAFE_VOLUME_LIQUIDITY_RATIO,
@@ -391,6 +510,24 @@ def score_pair(
     if mint_status.issue:
         risk.append(mint_status.issue.split(":", 1)[0])
 
+    if sellability is not None:
+        if sellability.sellable == "yes":
+            if sellability.price_impact_pct is None:
+                risk.append("sellability_unknown")
+            elif sellability.price_impact_pct > 40:
+                danger.append("sell_impact_extreme")
+            elif sellability.price_impact_pct > 15:
+                risk.append("sell_impact_too_high")
+            else:
+                pass_count += 1
+        elif sellability.sellable == "no" and not sellability.route_found:
+            if age_minutes is not None and age_minutes > DEFAULT_MIN_AGE_MINUTES:
+                danger.append("honeypot_no_route")
+            else:
+                risk.append("honeypot_no_route")
+        else:
+            risk.append("sellability_unknown")
+
     if danger:
         return "SCAM_LIKELY", tuple(danger + risk)
     if risk or pass_count < 6:
@@ -418,6 +555,7 @@ def to_row(
         age_minutes,
         price_change_5m,
         mint_status,
+        None,
         safe_min_liquidity_usd,
         min_safe_volume_liquidity_ratio,
         max_safe_volume_liquidity_ratio,
@@ -435,9 +573,50 @@ def to_row(
         price_change_5m=price_change_5m,
         mint_authority_active=mint_status.mint_authority_active,
         freeze_authority_active=mint_status.freeze_authority_active,
+        sellable="unknown",
+        sell_price_impact_pct=None,
+        sell_route_found=False,
+        sell_check_error=None,
         verdict=verdict,
         signals=signals,
         source=candidate.source,
+    )
+
+
+def apply_sellability(
+    row: PairRow,
+    sellability: SellabilityStatus,
+    mint_status: MintAuthorityStatus,
+    safe_min_liquidity_usd: float,
+    min_safe_volume_liquidity_ratio: float,
+    max_safe_volume_liquidity_ratio: float,
+) -> PairRow:
+    verdict, signals = score_pair(
+        row.liquidity,
+        row.volume_5m,
+        row.age_minutes,
+        row.price_change_5m,
+        mint_status,
+        sellability,
+        safe_min_liquidity_usd,
+        min_safe_volume_liquidity_ratio,
+        max_safe_volume_liquidity_ratio,
+    )
+    sellable = sellability.sellable
+    if (
+        sellability.sellable == "no"
+        and not sellability.route_found
+        and (row.age_minutes is None or row.age_minutes < DEFAULT_MIN_AGE_MINUTES)
+    ):
+        sellable = "unknown"
+    return replace(
+        row,
+        sellable=sellable,
+        sell_price_impact_pct=sellability.price_impact_pct,
+        sell_route_found=sellability.route_found,
+        sell_check_error=sellability.error,
+        verdict=verdict,
+        signals=signals,
     )
 
 
@@ -501,6 +680,18 @@ def collect_rows(
                 min_safe_volume_liquidity_ratio,
                 max_safe_volume_liquidity_ratio,
             )
+            if row.verdict == "SAFE":
+                sellability = check_sellability(session, candidate.token_address, timeout)
+                row = apply_sellability(
+                    row,
+                    sellability,
+                    mint_status,
+                    safe_min_liquidity_usd,
+                    min_safe_volume_liquidity_ratio,
+                    max_safe_volume_liquidity_ratio,
+                )
+                if sellability.sellable == "unknown" and sellability.error:
+                    issues.append(f"jupiter:{candidate.token_address}: {sellability.error}")
             if row.age_minutes is None:
                 rows.append(row)
                 continue
@@ -562,6 +753,12 @@ def bool_status(value: bool | None) -> str:
     return "unknown"
 
 
+def percent_status(value: Any) -> str:
+    if value is None:
+        return "unknown"
+    return f"{number(value):.2f}%"
+
+
 def telegram_alert_enabled() -> tuple[bool, str | None, str | None]:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
@@ -572,6 +769,10 @@ def telegram_alert_enabled() -> tuple[bool, str | None, str | None]:
 
 def should_alert(row: PairRow, min_age_minutes: int, max_age_hours: int) -> bool:
     if row.verdict != "SAFE":
+        return False
+    if row.sellable != "yes":
+        return False
+    if row.sell_price_impact_pct is None or row.sell_price_impact_pct > 15:
         return False
     if row.mint_authority_active is not False or row.freeze_authority_active is not False:
         return False
@@ -596,6 +797,12 @@ def paper_entry_blocked_reasons(row: PairRow) -> list[str]:
         reasons.append("vol_liq_too_high")
     elif volume_liquidity_ratio < MIN_SAFE_VOLUME_LIQUIDITY_RATIO:
         reasons.append("vol_liq_too_low")
+    if row.sellable == "no" and not row.sell_route_found:
+        reasons.append("honeypot_no_route")
+    elif row.sellable != "yes" and row.sell_check_error:
+        reasons.append("sellability_unknown")
+    elif row.sell_price_impact_pct is not None and row.sell_price_impact_pct > 15:
+        reasons.append("sell_impact_too_high")
     return reasons
 
 
@@ -618,6 +825,8 @@ def telegram_message(row: PairRow) -> str:
             f"Volume 5m: {money(row.volume_5m)}",
             f"Age: {age(row.age_minutes)}",
             f"Price change 5m: {row.price_change_5m:.2f}%",
+            f"Sellable: {row.sellable}",
+            f"Sell impact: {percent_status(row.sell_price_impact_pct)}",
             f"DexScreener: {row.dex_url}",
             f"Verdict: {row.verdict}",
             f"Signals: {', '.join(row.signals)}",
@@ -633,6 +842,8 @@ def paper_open_message(trade: dict[str, Any]) -> str:
             f"Mint: {trade.get('mint', '?')}",
             f"Entry: {price(number(trade.get('entry_price')))}",
             f"Liquidity: {money(number(trade.get('liquidity_at_entry')))}",
+            f"Sellable: {trade.get('sellable', 'unknown')}",
+            f"Sell impact: {percent_status(trade.get('sell_price_impact_pct'))}",
             f"Source: {trade.get('source', 'unknown')}",
             "Mode: simulated paper trade only",
         ]
@@ -721,6 +932,8 @@ DANGER_SIGNAL_NAMES = {
     "pump_weak_liq",
     "mint_auth_active",
     "freeze_auth_active",
+    "honeypot_no_route",
+    "sell_impact_extreme",
 }
 
 
@@ -736,6 +949,9 @@ RISK_SIGNAL_NAMES = {
     "low_vol_liq",
     "mint_auth_unknown",
     "freeze_auth_unknown",
+    "honeypot_no_route",
+    "sell_impact_too_high",
+    "sellability_unknown",
     "rpc_429",
     "rpc_failed",
     "rpc_error",
@@ -770,6 +986,10 @@ def paper_trade_entry_metadata(row: PairRow, now: float) -> dict[str, Any]:
         "volume_liquidity_ratio": volume_liquidity_ratio,
         "token_age_minutes": row.age_minutes,
         "price_change_5m": row.price_change_5m,
+        "sellable": row.sellable,
+        "sell_price_impact_pct": row.sell_price_impact_pct,
+        "sell_route_found": row.sell_route_found,
+        "sell_check_error": row.sell_check_error,
         "signal_set": signal_set_value,
         "signals": list(row.signals),
         "risk_signals": risk_signals,
@@ -1038,6 +1258,8 @@ def render_table(rows: list[PairRow]) -> str:
         "price_change_5m",
         "mint_auth",
         "freeze_auth",
+        "sellable",
+        "sell_impact",
         "verdict",
         "signals",
     ]
@@ -1052,6 +1274,8 @@ def render_table(rows: list[PairRow]) -> str:
             f"{row.price_change_5m:.2f}%",
             bool_status(row.mint_authority_active),
             bool_status(row.freeze_authority_active),
+            row.sellable,
+            percent_status(row.sell_price_impact_pct),
             row.verdict,
             ",".join(row.signals)[:28],
         ]
@@ -1262,6 +1486,10 @@ def export_paper_trades_csv(path: str = PAPER_TRADES_CSV_FILE) -> int:
         "volume_liquidity_ratio",
         "token_age_minutes",
         "price_change_5m",
+        "sellable",
+        "sell_price_impact_pct",
+        "sell_route_found",
+        "sell_check_error",
         "verdict",
         "liquidity_at_entry",
         "volume_5m_at_entry",
@@ -1464,7 +1692,7 @@ def parse_args() -> argparse.Namespace:
 
 def build_session() -> requests.Session:
     session = requests.Session()
-    session.headers.update({"Accept": "application/json", "User-Agent": "ArloBit/0.7"})
+    session.headers.update({"Accept": "application/json", "User-Agent": "ArloBit/0.8"})
     return session
 
 
