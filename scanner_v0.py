@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
 import json
 import os
 import random
@@ -41,6 +42,7 @@ DEFAULT_SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 TELEGRAM_STATE_FILE = ".arlobit_alerts.json"
 PAPER_TRADES_FILE = "paper_trades.json"
+PAPER_TRADES_CSV_FILE = "paper_trades.csv"
 DEFAULT_LOOP_INTERVAL_SECONDS = 180
 
 DEFAULT_MIN_AGE_MINUTES = 10
@@ -732,6 +734,11 @@ def open_paper_trades(rows: list[PairRow], min_age_minutes: int, max_age_hours: 
             "entry_price": row.price,
             "entry_time": now,
             "liquidity_at_entry": row.liquidity,
+            "volume_5m_at_entry": row.volume_5m,
+            "age_minutes_at_entry": row.age_minutes,
+            "volume_liquidity_ratio_at_entry": row.volume_5m / row.liquidity if row.liquidity > 0 else None,
+            "signals": list(row.signals),
+            "verdict": row.verdict,
             "source": row.source,
             "status": "open",
             "current_price": row.price,
@@ -922,6 +929,223 @@ def render_table(rows: list[PairRow]) -> str:
     return "\n".join([line, divider, *body])
 
 
+def normalized_exit_reason(trade: dict[str, Any]) -> str:
+    reason = str(trade.get("exit_reason") or "other")
+    if reason == "max_hold_time":
+        return "timeout"
+    if reason in {"take_profit", "stop_loss", "rug", "timeout"}:
+        return reason
+    return "other"
+
+
+def trade_pnl(trade: dict[str, Any]) -> float:
+    return number(trade.get("final_pnl_percent"))
+
+
+def trade_hold_seconds(trade: dict[str, Any]) -> float | None:
+    entry_time = number(trade.get("entry_time"), default=-1.0)
+    exit_time = number(trade.get("exit_time"), default=-1.0)
+    if entry_time <= 0 or exit_time <= 0 or exit_time < entry_time:
+        return None
+    return exit_time - entry_time
+
+
+def format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "n/a"
+    total_seconds = int(round(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def signal_set(trade: dict[str, Any]) -> str:
+    signals = trade.get("signals")
+    if isinstance(signals, str):
+        parts = [part.strip() for part in signals.split(",") if part.strip()]
+    elif isinstance(signals, list | tuple):
+        parts = [str(part).strip() for part in signals if str(part).strip()]
+    else:
+        parts = []
+    return "+".join(parts) if parts else "unknown"
+
+
+def liquidity_bucket(trade: dict[str, Any]) -> str:
+    liquidity = number(trade.get("liquidity_at_entry"), default=-1.0)
+    if liquidity < 0:
+        return "unknown"
+    if liquidity < 30_000:
+        return "<$30k"
+    if liquidity < 50_000:
+        return "$30k-$50k"
+    if liquidity < 100_000:
+        return "$50k-$100k"
+    if liquidity < 250_000:
+        return "$100k-$250k"
+    return ">=$250k"
+
+
+def token_age_bucket(trade: dict[str, Any]) -> str:
+    age_minutes = number(trade.get("age_minutes_at_entry"), default=-1.0)
+    if age_minutes < 0:
+        return "unknown"
+    if age_minutes < 10:
+        return "<10m"
+    if age_minutes < 30:
+        return "10m-30m"
+    if age_minutes < 60:
+        return "30m-1h"
+    if age_minutes < 6 * 60:
+        return "1h-6h"
+    if age_minutes < 24 * 60:
+        return "6h-24h"
+    return ">=24h"
+
+
+def volume_liquidity_ratio_bucket(trade: dict[str, Any]) -> str:
+    ratio = number(trade.get("volume_liquidity_ratio_at_entry"), default=-1.0)
+    if ratio < 0:
+        volume = number(trade.get("volume_5m_at_entry"), default=-1.0)
+        liquidity = number(trade.get("liquidity_at_entry"), default=-1.0)
+        if volume < 0 or liquidity <= 0:
+            return "unknown"
+        ratio = volume / liquidity
+    if ratio < 0.01:
+        return "<0.01"
+    if ratio < 0.05:
+        return "0.01-0.05"
+    if ratio < 0.10:
+        return "0.05-0.10"
+    if ratio < 0.25:
+        return "0.10-0.25"
+    if ratio < 0.50:
+        return "0.25-0.50"
+    if ratio < 1.00:
+        return "0.50-1.00"
+    if ratio < 2.00:
+        return "1.00-2.00"
+    return ">=2.00"
+
+
+def summarize_trades(trades: list[dict[str, Any]]) -> dict[str, float]:
+    count = len(trades)
+    pnls = [trade_pnl(trade) for trade in trades]
+    wins = [pnl for pnl in pnls if pnl > 0]
+    hold_times = [hold for trade in trades if (hold := trade_hold_seconds(trade)) is not None]
+    return {
+        "count": float(count),
+        "pnl": sum(pnls),
+        "wins": float(len(wins)),
+        "win_rate": (len(wins) / count * 100) if count else 0.0,
+        "avg_pnl": (sum(pnls) / count) if count else 0.0,
+        "avg_hold": (sum(hold_times) / len(hold_times)) if hold_times else -1.0,
+    }
+
+
+def grouped_trade_summaries(
+    trades: list[dict[str, Any]],
+    key_fn: Any,
+) -> list[tuple[str, dict[str, float]]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for trade in trades:
+        groups.setdefault(key_fn(trade), []).append(trade)
+    return sorted(
+        ((name, summarize_trades(group)) for name, group in groups.items()),
+        key=lambda item: (item[1]["pnl"], item[0]),
+    )
+
+
+def render_summary_table(title: str, rows: list[tuple[str, dict[str, float]]]) -> list[str]:
+    lines = [title]
+    if not rows:
+        return lines + ["  n/a"]
+    name_width = max(len("bucket"), *(len(name) for name, _ in rows))
+    lines.append(f"  {'bucket'.ljust(name_width)} | trades | win rate | pnl | avg pnl | avg hold")
+    lines.append(f"  {'-' * name_width}-+--------+----------+-----+---------+---------")
+    for name, summary in rows:
+        avg_hold = None if summary["avg_hold"] < 0 else summary["avg_hold"]
+        lines.append(
+            "  "
+            f"{name.ljust(name_width)} | "
+            f"{int(summary['count']):>6} | "
+            f"{summary['win_rate']:>7.2f}% | "
+            f"{summary['pnl']:>6.2f}% | "
+            f"{summary['avg_pnl']:>7.2f}% | "
+            f"{format_duration(avg_hold):>7}"
+        )
+    return lines
+
+
+def render_trade_rankings(title: str, trades: list[dict[str, Any]]) -> list[str]:
+    lines = [title]
+    if not trades:
+        return lines + ["  n/a"]
+    lines.append("  pnl      | hold      | exit        | source   | symbol       | mint")
+    lines.append("  ---------+-----------+-------------+----------+--------------+-------------")
+    for trade in trades:
+        symbol = terminal_text(trade.get("symbol") or "?", 12)
+        mint = terminal_text(trade.get("mint") or "", 12)
+        source = terminal_text(trade.get("source") or "unknown", 8)
+        reason = terminal_text(normalized_exit_reason(trade), 11)
+        lines.append(
+            "  "
+            f"{trade_pnl(trade):>7.2f}% | "
+            f"{format_duration(trade_hold_seconds(trade)):>9} | "
+            f"{reason:<11} | "
+            f"{source:<8} | "
+            f"{symbol:<12} | "
+            f"{mint}"
+        )
+    return lines
+
+
+def export_paper_trades_csv(path: str = PAPER_TRADES_CSV_FILE) -> int:
+    trades = [trade for trade in load_paper_trades().get("trades", []) if isinstance(trade, dict)]
+    preferred_columns = [
+        "status",
+        "symbol",
+        "mint",
+        "source",
+        "verdict",
+        "signals",
+        "entry_time",
+        "exit_time",
+        "hold_seconds",
+        "entry_price",
+        "exit_price",
+        "current_price",
+        "final_pnl_percent",
+        "current_pnl_percent",
+        "max_gain",
+        "max_drawdown",
+        "exit_reason",
+        "liquidity_at_entry",
+        "volume_5m_at_entry",
+        "age_minutes_at_entry",
+        "volume_liquidity_ratio_at_entry",
+        "dex_url",
+    ]
+    extra_columns = sorted({key for trade in trades for key in trade.keys()} - set(preferred_columns))
+    columns = preferred_columns + extra_columns
+
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        for trade in trades:
+            row = dict(trade)
+            if isinstance(row.get("signals"), list | tuple):
+                row["signals"] = ",".join(str(signal) for signal in row["signals"])
+            hold_seconds = trade_hold_seconds(trade)
+            row["hold_seconds"] = "" if hold_seconds is None else f"{hold_seconds:.0f}"
+            writer.writerow(row)
+
+    return len(trades)
+
+
 def render_paper_stats() -> str:
     trades = [trade for trade in load_paper_trades().get("trades", []) if isinstance(trade, dict)]
     total = len(trades)
@@ -938,41 +1162,43 @@ def render_paper_stats() -> str:
     best = max(final_pnls) if final_pnls else 0.0
     worst = min(final_pnls) if final_pnls else 0.0
     total_pnl = sum(final_pnls)
-    exit_reasons = {
-        "take_profit": 0,
-        "stop_loss": 0,
-        "rug": 0,
-        "timeout": 0,
-        "other": 0,
-    }
-    for trade in closed:
-        reason = str(trade.get("exit_reason") or "other")
-        if reason == "max_hold_time":
-            reason = "timeout"
-        if reason not in exit_reasons:
-            reason = "other"
-        exit_reasons[reason] += 1
+    hold_times = [hold for trade in closed if (hold := trade_hold_seconds(trade)) is not None]
+    avg_hold_time = (sum(hold_times) / len(hold_times)) if hold_times else None
 
-    return "\n".join(
-        [
-            "Paper trading stats",
-            f"total trades: {total}",
-            f"open: {open_count}",
-            f"closed: {closed_count}",
-            f"win rate: {win_rate:.2f}%",
-            f"avg win: {avg_win:.2f}%",
-            f"avg loss: {avg_loss:.2f}%",
-            f"best: {best:.2f}%",
-            f"worst: {worst:.2f}%",
-            f"total simulated pnl: {total_pnl:.2f}%",
-            "exit reasons:",
-            f"  take_profit: {exit_reasons['take_profit']}",
-            f"  stop_loss: {exit_reasons['stop_loss']}",
-            f"  rug: {exit_reasons['rug']}",
-            f"  timeout: {exit_reasons['timeout']}",
-            f"  other: {exit_reasons['other']}",
-        ]
-    )
+    worst_trades = sorted(closed, key=trade_pnl)[:10]
+    best_trades = sorted(closed, key=trade_pnl, reverse=True)[:10]
+
+    lines = [
+        "Paper trading stats",
+        f"total trades: {total}",
+        f"open: {open_count}",
+        f"closed: {closed_count}",
+        f"win rate: {win_rate:.2f}%",
+        f"avg win: {avg_win:.2f}%",
+        f"avg loss: {avg_loss:.2f}%",
+        f"average hold time: {format_duration(avg_hold_time)}",
+        f"best: {best:.2f}%",
+        f"worst: {worst:.2f}%",
+        f"total simulated pnl: {total_pnl:.2f}%",
+        "",
+        *render_summary_table("PnL by exit_reason", grouped_trade_summaries(closed, normalized_exit_reason)),
+        "",
+        *render_trade_rankings("Worst 10 trades", worst_trades),
+        "",
+        *render_trade_rankings("Best 10 trades", best_trades),
+        "",
+        *render_summary_table("PnL by signal set", grouped_trade_summaries(closed, signal_set)),
+        "",
+        *render_summary_table("PnL by liquidity bucket", grouped_trade_summaries(closed, liquidity_bucket)),
+        "",
+        *render_summary_table("PnL by token age bucket", grouped_trade_summaries(closed, token_age_bucket)),
+        "",
+        *render_summary_table(
+            "PnL by volume/liquidity ratio bucket",
+            grouped_trade_summaries(closed, volume_liquidity_ratio_bucket),
+        ),
+    ]
+    return "\n".join(lines)
 
 
 def positive_int(value: str) -> int:
@@ -1002,6 +1228,7 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument("--once", action="store_true", help="run one scan cycle and exit")
     mode.add_argument("--loop", action="store_true", help="run continuously until Ctrl+C")
     mode.add_argument("--stats", action="store_true", help="show paper trading stats and exit")
+    mode.add_argument("--export-trades-csv", action="store_true", help="export paper_trades.json to paper_trades.csv")
     mode.add_argument(
         "--test-paper-alert",
         action="store_true",
@@ -1257,6 +1484,10 @@ def main() -> int:
         return run_loop(args)
     if args.stats:
         print(render_paper_stats())
+        return 0
+    if args.export_trades_csv:
+        exported = export_paper_trades_csv()
+        print(f"Exported {exported} paper trades to {PAPER_TRADES_CSV_FILE}")
         return 0
     if args.test_paper_alert:
         return run_test_paper_alert(args)
