@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-ArloBit Solana Scanner v0.7
+ArloBit Solana Scanner v0.7.1
 
 Scans fresh Solana token profiles/boosts from the free DexScreener API,
 fetches pair details, filters by pairCreatedAt, and prints a compact
-terminal risk table. v0.7 tightens SAFE scoring, improves RPC stability,
-and adds stronger paper-trade loss protection.
+terminal risk table. v0.7.1 improves paper-trade metadata for debug stats.
 
 This script never trades and never loads private keys.
 """
@@ -642,6 +641,26 @@ def save_paper_trades(state: dict[str, Any]) -> None:
         json.dump(state, handle, indent=2, sort_keys=True)
 
 
+def reset_paper_trades() -> str:
+    timestamp_suffix = time.strftime("%Y%m%d_%H%M%S")
+    backup_file = f"paper_trades_backup_{timestamp_suffix}.json"
+    counter = 1
+    while os.path.exists(backup_file):
+        backup_file = f"paper_trades_backup_{timestamp_suffix}_{counter}.json"
+        counter += 1
+
+    try:
+        with open(PAPER_TRADES_FILE, "rb") as source:
+            current_data = source.read()
+    except FileNotFoundError:
+        current_data = json.dumps({"trades": []}, indent=2).encode("utf-8")
+
+    with open(backup_file, "wb") as backup:
+        backup.write(current_data)
+    save_paper_trades({"trades": []})
+    return backup_file
+
+
 def open_trade_mints(state: dict[str, Any]) -> set[str]:
     return {
         str(trade.get("mint"))
@@ -662,6 +681,73 @@ def pnl_percent(entry_price: float, current_price: float) -> float:
     if entry_price <= 0:
         return 0.0
     return ((current_price - entry_price) / entry_price) * 100
+
+
+DANGER_SIGNAL_NAMES = {
+    "very_low_liq",
+    "vol_liq_anomaly",
+    "crash_5m",
+    "drop_5m",
+    "pump_weak_liq",
+    "mint_auth_active",
+    "freeze_auth_active",
+}
+
+
+RISK_SIGNAL_NAMES = {
+    "missing_age",
+    "too_new",
+    "old_pair",
+    "low_liq",
+    "weak_liq",
+    "no_5m_volume",
+    "low_5m_volume",
+    "high_vol_liq",
+    "low_vol_liq",
+    "mint_auth_unknown",
+    "freeze_auth_unknown",
+    "rpc_429",
+    "rpc_failed",
+    "rpc_error",
+    "mint_account_missing",
+    "mint_data_missing",
+    "mint_account_too_short",
+    "mint_option_unparseable",
+    "mint_unparseable",
+    "mixed",
+}
+
+
+def split_signal_severity(signals: tuple[str, ...]) -> tuple[list[str], list[str]]:
+    danger_signals = [signal for signal in signals if signal in DANGER_SIGNAL_NAMES]
+    risk_signals = [signal for signal in signals if signal in RISK_SIGNAL_NAMES]
+    return risk_signals, danger_signals
+
+
+def paper_trade_entry_metadata(row: PairRow, now: float) -> dict[str, Any]:
+    volume_liquidity_ratio = row.volume_5m / row.liquidity if row.liquidity > 0 else None
+    risk_signals, danger_signals = split_signal_severity(row.signals)
+    signal_set_value = "+".join(row.signals) if row.signals else "unknown"
+    return {
+        "entry_price": row.price,
+        "entry_time": now,
+        "token_name": row.token,
+        "symbol": row.symbol,
+        "mint": row.token_address,
+        "source": row.source,
+        "liquidity_usd": row.liquidity,
+        "volume_5m": row.volume_5m,
+        "volume_liquidity_ratio": volume_liquidity_ratio,
+        "token_age_minutes": row.age_minutes,
+        "price_change_5m": row.price_change_5m,
+        "signal_set": signal_set_value,
+        "signals": list(row.signals),
+        "risk_signals": risk_signals,
+        "danger_signals": danger_signals,
+        "risk_count": len(risk_signals),
+        "danger_count": len(danger_signals),
+        "entry_verdict": row.verdict,
+    }
 
 
 def update_open_paper_trades(
@@ -729,15 +815,11 @@ def open_paper_trades(rows: list[PairRow], min_age_minutes: int, max_age_hours: 
             continue
 
         trade = {
-            "mint": row.token_address,
-            "symbol": row.symbol,
-            "entry_price": row.price,
-            "entry_time": now,
+            **paper_trade_entry_metadata(row, now),
             "liquidity_at_entry": row.liquidity,
             "volume_5m_at_entry": row.volume_5m,
             "age_minutes_at_entry": row.age_minutes,
             "volume_liquidity_ratio_at_entry": row.volume_5m / row.liquidity if row.liquidity > 0 else None,
-            "signals": list(row.signals),
             "verdict": row.verdict,
             "source": row.source,
             "status": "open",
@@ -964,18 +1046,12 @@ def format_duration(seconds: float | None) -> str:
 
 
 def signal_set(trade: dict[str, Any]) -> str:
-    signals = trade.get("signals")
-    if isinstance(signals, str):
-        parts = [part.strip() for part in signals.split(",") if part.strip()]
-    elif isinstance(signals, list | tuple):
-        parts = [str(part).strip() for part in signals if str(part).strip()]
-    else:
-        parts = []
-    return "+".join(parts) if parts else "unknown"
+    value = str(trade.get("signal_set") or "").strip()
+    return value if value else "unknown"
 
 
 def liquidity_bucket(trade: dict[str, Any]) -> str:
-    liquidity = number(trade.get("liquidity_at_entry"), default=-1.0)
+    liquidity = number(trade.get("liquidity_usd"), default=-1.0)
     if liquidity < 0:
         return "unknown"
     if liquidity < 30_000:
@@ -990,7 +1066,7 @@ def liquidity_bucket(trade: dict[str, Any]) -> str:
 
 
 def token_age_bucket(trade: dict[str, Any]) -> str:
-    age_minutes = number(trade.get("age_minutes_at_entry"), default=-1.0)
+    age_minutes = number(trade.get("token_age_minutes"), default=-1.0)
     if age_minutes < 0:
         return "unknown"
     if age_minutes < 10:
@@ -1007,13 +1083,9 @@ def token_age_bucket(trade: dict[str, Any]) -> str:
 
 
 def volume_liquidity_ratio_bucket(trade: dict[str, Any]) -> str:
-    ratio = number(trade.get("volume_liquidity_ratio_at_entry"), default=-1.0)
+    ratio = number(trade.get("volume_liquidity_ratio"), default=-1.0)
     if ratio < 0:
-        volume = number(trade.get("volume_5m_at_entry"), default=-1.0)
-        liquidity = number(trade.get("liquidity_at_entry"), default=-1.0)
-        if volume < 0 or liquidity <= 0:
-            return "unknown"
-        ratio = volume / liquidity
+        return "unknown"
     if ratio < 0.01:
         return "<0.01"
     if ratio < 0.05:
@@ -1107,11 +1179,17 @@ def export_paper_trades_csv(path: str = PAPER_TRADES_CSV_FILE) -> int:
     trades = [trade for trade in load_paper_trades().get("trades", []) if isinstance(trade, dict)]
     preferred_columns = [
         "status",
+        "token_name",
         "symbol",
         "mint",
         "source",
-        "verdict",
+        "entry_verdict",
+        "signal_set",
         "signals",
+        "risk_signals",
+        "danger_signals",
+        "risk_count",
+        "danger_count",
         "entry_time",
         "exit_time",
         "hold_seconds",
@@ -1123,6 +1201,12 @@ def export_paper_trades_csv(path: str = PAPER_TRADES_CSV_FILE) -> int:
         "max_gain",
         "max_drawdown",
         "exit_reason",
+        "liquidity_usd",
+        "volume_5m",
+        "volume_liquidity_ratio",
+        "token_age_minutes",
+        "price_change_5m",
+        "verdict",
         "liquidity_at_entry",
         "volume_5m_at_entry",
         "age_minutes_at_entry",
@@ -1137,8 +1221,9 @@ def export_paper_trades_csv(path: str = PAPER_TRADES_CSV_FILE) -> int:
         writer.writeheader()
         for trade in trades:
             row = dict(trade)
-            if isinstance(row.get("signals"), list | tuple):
-                row["signals"] = ",".join(str(signal) for signal in row["signals"])
+            for list_field in ("signals", "risk_signals", "danger_signals"):
+                if isinstance(row.get(list_field), list | tuple):
+                    row[list_field] = ",".join(str(signal) for signal in row[list_field])
             hold_seconds = trade_hold_seconds(trade)
             row["hold_seconds"] = "" if hold_seconds is None else f"{hold_seconds:.0f}"
             writer.writerow(row)
@@ -1229,6 +1314,7 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument("--loop", action="store_true", help="run continuously until Ctrl+C")
     mode.add_argument("--stats", action="store_true", help="show paper trading stats and exit")
     mode.add_argument("--export-trades-csv", action="store_true", help="export paper_trades.json to paper_trades.csv")
+    mode.add_argument("--reset-paper", action="store_true", help="back up paper_trades.json and reset paper trades")
     mode.add_argument(
         "--test-paper-alert",
         action="store_true",
@@ -1488,6 +1574,11 @@ def main() -> int:
     if args.export_trades_csv:
         exported = export_paper_trades_csv()
         print(f"Exported {exported} paper trades to {PAPER_TRADES_CSV_FILE}")
+        return 0
+    if args.reset_paper:
+        backup_file = reset_paper_trades()
+        print(f"Backed up paper trades to {backup_file}")
+        print(f"Reset {PAPER_TRADES_FILE} to an empty paper trading file")
         return 0
     if args.test_paper_alert:
         return run_test_paper_alert(args)

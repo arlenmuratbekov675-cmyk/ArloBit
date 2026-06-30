@@ -1,4 +1,4 @@
-# ArloBit Solana Scanner v0.7
+# ArloBit Solana Scanner v0.7.1
 
 Standalone terminal scanner for fresh Solana token pairs using the free
 DexScreener API.
@@ -63,7 +63,7 @@ prints health output, and continues instead of exiting permanently.
 
 ## Data Sources
 
-v0.7 starts from fresh DexScreener Solana token candidates:
+v0.7.1 starts from fresh DexScreener Solana token candidates:
 
 - `GET /token-profiles/latest/v1`
 - `GET /token-boosts/latest/v1`
@@ -77,7 +77,7 @@ Pair age comes from `pairCreatedAt`. By default, rows are included when pair age
 is greater than 10 minutes and less than 24 hours. Missing `pairCreatedAt` is
 shown as `unknown` and scored as `RISKY`.
 
-v0.7 also checks the Solana mint account for each token:
+v0.7.1 also checks the Solana mint account for each token:
 
 - `getAccountInfo` on the token mint address
 - SPL Token Mint layout parsing from base64 account data
@@ -162,18 +162,27 @@ python scanner_v0.py --loop
 
 ## Paper Trading
 
-v0.7 includes simulated paper trading only. It never buys, sells, signs, or uses
+v0.7.1 includes simulated paper trading only. It never buys, sells, signs, or uses
 private keys.
 
 When a token is `SAFE` and passes the Telegram alert criteria, the scanner opens
 a paper trade in `paper_trades.json` with:
 
-- mint
-- symbol
 - entry price
 - entry time
-- liquidity at entry
+- token name
+- mint
+- symbol
 - source
+- liquidity USD
+- 5-minute volume
+- volume/liquidity ratio
+- token age in minutes
+- 5-minute price change
+- signal set
+- signals, risk signals, and danger signals
+- risk and danger counts
+- entry verdict
 
 On each scan cycle, open paper trades are rechecked against DexScreener. The
 scanner tracks current PnL, max gain, and max drawdown. A paper trade closes
@@ -193,8 +202,29 @@ Show paper trade stats:
 python scanner_v0.py --stats
 ```
 
-Stats include an `exit reasons` breakdown for `take_profit`, `stop_loss`, `rug`,
-`timeout`, and `other`.
+Stats include PnL by exit reason, win rate by exit reason, best/worst trades,
+average hold time, and PnL by signal set, liquidity bucket, token age bucket,
+and volume/liquidity ratio bucket.
+
+Export paper trades to CSV:
+
+```powershell
+python scanner_v0.py --export-trades-csv
+```
+
+Reset paper trading before a clean test:
+
+```powershell
+python scanner_v0.py --reset-paper
+```
+
+`--reset-paper` writes a timestamped backup of the current `paper_trades.json`
+and then creates a fresh empty paper trading file.
+
+Paper trades opened before v0.7.1 do not have the full metadata needed for the
+new stats buckets, so some historical rows may show as `unknown`. For the next
+100-trade paper test, reset paper stats first so the debug analytics are based
+on v0.7.1 metadata.
 
 ## Verdicts
 
