@@ -31,6 +31,11 @@ else:
 
 import requests
 
+try:
+    from arlobit import collector as research
+except Exception:  # research collection must never break scanning
+    research = None
+
 
 BASE_URL = "https://api.dexscreener.com"
 SOLANA = "solana"
@@ -1414,6 +1419,8 @@ def collect_rows(
                 min_safe_volume_liquidity_ratio,
                 max_safe_volume_liquidity_ratio,
             )
+            if research:
+                research.observe_pair(row, pair)
             if row.age_minutes is None:
                 rows.append(row)
                 continue
@@ -1481,6 +1488,8 @@ def collect_rows(
             debug_enrich_count += 1
         enriched_rows.append(enriched_row)
     rows = enriched_rows
+    if research:
+        research.observe_enriched(rows)
     rows.sort(
         key=lambda row: (
             row.verdict != "SAFE",
@@ -1957,6 +1966,8 @@ def open_paper_trades(
         existing_mints.add(row.token_address)
         opened += 1
         messages.append(paper_open_message(trade))
+        if research:
+            research.note_paper_entry(row.token_address)
 
     state["blocked_paper_reason_counts"] = merge_blocked_paper_reason_counts(
         state.get("blocked_paper_reason_counts"),
@@ -2635,6 +2646,8 @@ def print_health(result: ScanResult) -> None:
 
 def run_scan_once(args: argparse.Namespace) -> ScanResult:
     session = build_session()
+    if research:
+        research.begin_cycle(args.min_age_minutes, args.max_age_hours, scanner_version="0.9.4")
     paper_closed, paper_issues, paper_close_messages = update_and_save_paper_trades(session, args.timeout)
     paper_close_alerts, paper_close_alert_issues = send_telegram_messages(
         session=session,
@@ -2689,6 +2702,24 @@ def run_scan_once(args: argparse.Namespace) -> ScanResult:
     paper_alerts_sent = paper_close_alerts + paper_open_alerts
     if paper_opened or paper_closed:
         print(f"Paper trades: opened={paper_opened} closed={paper_closed} paper_alerts_sent={paper_alerts_sent}")
+    if research:
+        research.sample_rejected_enrichment(
+            session=session,
+            timeout=args.timeout,
+            rpc_url=args.rpc_url,
+            helius_url=helius_rpc_url(os.environ.get("HELIUS_API_KEY")),
+            issues=issues,
+            check_sellability=check_sellability,
+            fetch_holder_status=fetch_holder_status,
+            fetch_creator_status=fetch_creator_status,
+            apply_native_edge=apply_native_edge,
+        )
+        research.finalize_cycle(
+            issues=issues,
+            candidate_count=candidate_count,
+            pairs_scanned=pairs_scanned,
+            blocked_reasons_fn=paper_entry_blocked_reasons,
+        )
     result = ScanResult(
         rows=rows,
         issues=issues,

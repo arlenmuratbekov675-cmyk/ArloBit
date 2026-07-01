@@ -4,3 +4,5 @@ __pycache__/
 .env
 .arlobit_alerts.json
 paper_trades.json
+data/
+reports/
