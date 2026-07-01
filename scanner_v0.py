@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-ArloBit Solana Scanner v0.9.2
+ArloBit Solana Scanner v0.9.4
 
 Scans fresh Solana token profiles/boosts from the free DexScreener API,
 fetches pair details, filters by pairCreatedAt, and prints a compact
-terminal risk table. v0.9.2 fixes holder/creator enrichment.
+terminal risk table. v0.9.4 fixes enrichment pipeline ordering.
 
 This script never trades and never loads private keys.
 """
@@ -304,14 +304,6 @@ def print_rpc_error_debug(method: str, params: list[Any] | dict[str, Any], http_
         file=sys.stderr,
     )
 
-
-def log(message: str) -> None:
-    print(message, file=sys.stderr)
-
-
-PRINTED_LARGEST_ACCOUNTS_DEBUG = False
-
-
 def rpc_request_payload(
     session: requests.Session,
     rpc_url: str,
@@ -569,7 +561,6 @@ def fetch_holder_status_rpc(
     token_address: str,
     timeout: int,
 ) -> HolderStatus:
-    global PRINTED_LARGEST_ACCOUNTS_DEBUG
     if not is_valid_solana_pubkey(token_address):
         return HolderStatus(
             status="unknown",
@@ -578,9 +569,6 @@ def fetch_holder_status_rpc(
             result_count=0,
         )
     response = rpc_request_payload(session, rpc_url, "getTokenLargestAccounts", [token_address], timeout)
-    if not PRINTED_LARGEST_ACCOUNTS_DEBUG:
-        log(f"getTokenLargestAccounts raw response for mint {token_address}: {json.dumps(response, sort_keys=True)}")
-        PRINTED_LARGEST_ACCOUNTS_DEBUG = True
     result = (response or {}).get("result") or {}
     accounts = result.get("value") or []
     if not isinstance(accounts, list) or not accounts:
@@ -611,24 +599,20 @@ def fetch_holder_status(
         try:
             return fetch_holder_status_rpc(session, helius_url, token_address, timeout)
         except Exception as exc:
-            log(f"enrichment_error: {exc} for mint {token_address}")
             errors.append(f"helius_largest:{exc}")
         try:
             return fetch_holder_status_helius(session, helius_url, helius_url, token_address, timeout)
         except Exception as exc:
-            log(f"enrichment_error: {exc} for mint {token_address}")
             errors.append(f"helius_accounts:{exc}")
         if rpc_url != helius_url:
             try:
                 return fetch_holder_status_rpc(session, rpc_url, token_address, timeout)
             except Exception as exc:
-                log(f"enrichment_error: {exc} for mint {token_address}")
                 errors.append(f"rpc:{exc}")
         return HolderStatus(status="unknown", error=";".join(errors) if errors else "holder_unknown")
     try:
         return fetch_holder_status_rpc(session, rpc_url, token_address, timeout)
     except Exception as exc:
-        log(f"enrichment_error: {exc} for mint {token_address}")
         errors.append(f"rpc:{exc}")
     return HolderStatus(status="unknown", error=";".join(errors) if errors else "holder_unknown")
 
@@ -798,19 +782,16 @@ def fetch_creator_status(
         if error:
             errors.append(error)
     except Exception as exc:
-        log(f"enrichment_error: {exc} for mint {token_address}")
         errors.append(f"creator_mint_history:{exc}")
     if not wallet:
         return CreatorStatus(quality="unknown", error=";".join([*errors, "creator_missing"]), signature=signature)
     try:
         balance = fetch_sol_balance(session, creator_rpc_url, wallet, timeout)
     except Exception as exc:
-        log(f"enrichment_error: {exc} for mint {token_address}")
         return CreatorStatus(wallet=wallet, quality="error", error=f"creator_balance:{exc}", signature=signature)
     try:
         age_days = fetch_wallet_age_days(session, creator_rpc_url, wallet, timeout)
     except Exception as exc:
-        log(f"enrichment_error: {exc} for mint {token_address}")
         return CreatorStatus(wallet=wallet, sol_balance=balance, quality="error", error=f"creator_age:{exc}", signature=signature)
     quality = creator_quality(balance, age_days)
     if quality == "unknown":
@@ -1387,11 +1368,13 @@ def collect_rows(
     now_ms = int(time.time() * 1000)
     seen_pairs: set[str] = set()
     mint_cache: dict[str, MintAuthorityStatus] = {}
+    sellability_cache: dict[str, SellabilityStatus] = {}
     holder_cache: dict[str, HolderStatus] = {}
     creator_cache: dict[str, CreatorStatus] = {}
     rows: list[PairRow] = []
     rpc_calls = 0
     debug_enrich_count = 0
+    debug_enrich_mints: set[str] = set()
 
     for candidate in candidates[:candidate_limit]:
         mint_status = mint_cache.get(candidate.token_address)
@@ -1409,34 +1392,6 @@ def collect_rows(
             mint_cache[candidate.token_address] = mint_status
             if mint_status.issue:
                 issues.append(f"rpc:{candidate.token_address}: {mint_status.issue}")
-
-        if debug_enrich and debug_enrich_count < 3:
-            holder_status = holder_cache.get(candidate.token_address)
-            if holder_status is None:
-                holder_status = fetch_holder_status(
-                    session,
-                    candidate.token_address,
-                    rpc_url,
-                    helius_url,
-                    timeout,
-                )
-                holder_cache[candidate.token_address] = holder_status
-                if holder_status.status != "ok" and holder_status.error:
-                    issues.append(f"holders:{candidate.token_address}: {holder_status.error}")
-            creator_status = creator_cache.get(candidate.token_address)
-            if creator_status is None:
-                creator_status = fetch_creator_status(
-                    session,
-                    candidate.token_address,
-                    rpc_url,
-                    helius_url,
-                    timeout,
-                )
-                creator_cache[candidate.token_address] = creator_status
-                if creator_status.quality in {"unknown", "error"} and creator_status.error:
-                    issues.append(f"creator:{candidate.token_address}: {creator_status.error}")
-            print_debug_enrich(candidate.token_address, holder_status, creator_status)
-            debug_enrich_count += 1
 
         try:
             pairs = fetch_token_pairs(session, candidate.token_address, timeout)
@@ -1459,51 +1414,73 @@ def collect_rows(
                 min_safe_volume_liquidity_ratio,
                 max_safe_volume_liquidity_ratio,
             )
-            if row.verdict == "SAFE":
-                sellability = check_sellability(session, candidate.token_address, timeout)
-                row = apply_sellability(
-                    row,
-                    sellability,
-                    mint_status,
-                    safe_min_liquidity_usd,
-                    min_safe_volume_liquidity_ratio,
-                    max_safe_volume_liquidity_ratio,
-                )
-                if sellability.sellable == "unknown" and sellability.error:
-                    issues.append(f"jupiter:{candidate.token_address}: {sellability.error}")
-            if row.verdict == "SAFE":
-                time.sleep(NATIVE_EDGE_CHECK_DELAY_SECONDS)
-                holder_status = holder_cache.get(candidate.token_address)
-                if holder_status is None:
-                    holder_status = fetch_holder_status(
-                        session,
-                        candidate.token_address,
-                        rpc_url,
-                        helius_url,
-                        timeout,
-                    )
-                    holder_cache[candidate.token_address] = holder_status
-                    if holder_status.status != "ok" and holder_status.error:
-                        issues.append(f"holders:{candidate.token_address}: {holder_status.error}")
-                creator_status = creator_cache.get(candidate.token_address)
-                if creator_status is None:
-                    creator_status = fetch_creator_status(
-                        session,
-                        candidate.token_address,
-                        rpc_url,
-                        helius_url,
-                        timeout,
-                    )
-                    creator_cache[candidate.token_address] = creator_status
-                    if creator_status.quality in {"unknown", "error"} and creator_status.error:
-                        issues.append(f"creator:{candidate.token_address}: {creator_status.error}")
-                row = apply_native_edge(row, holder_status, creator_status)
             if row.age_minutes is None:
                 rows.append(row)
                 continue
             if min_age_minutes < row.age_minutes < max_age_hours * 60:
                 rows.append(row)
 
+    rows.sort(
+        key=lambda row: (
+            row.verdict != "SAFE",
+            row.verdict == "SCAM_LIKELY",
+            -row.arlobit_score,
+            row.age_minutes is None,
+            row.age_minutes or float("inf"),
+            -row.volume_5m,
+        )
+    )
+    enriched_rows: list[PairRow] = []
+    for row in rows[:limit]:
+        mint_status = mint_cache[row.token_address]
+        sellability = sellability_cache.get(row.token_address)
+        if sellability is None:
+            sellability = check_sellability(session, row.token_address, timeout)
+            sellability_cache[row.token_address] = sellability
+            if sellability.sellable == "unknown" and sellability.error:
+                issues.append(f"jupiter:{row.token_address}: {sellability.error}")
+        enriched_row = apply_sellability(
+            row,
+            sellability,
+            mint_status,
+            safe_min_liquidity_usd,
+            min_safe_volume_liquidity_ratio,
+            max_safe_volume_liquidity_ratio,
+        )
+
+        holder_status = holder_cache.get(row.token_address)
+        creator_status = creator_cache.get(row.token_address)
+        if holder_status is None or creator_status is None:
+            time.sleep(NATIVE_EDGE_CHECK_DELAY_SECONDS)
+        if holder_status is None:
+            holder_status = fetch_holder_status(
+                session,
+                row.token_address,
+                rpc_url,
+                helius_url,
+                timeout,
+            )
+            holder_cache[row.token_address] = holder_status
+            if holder_status.status != "ok" and holder_status.error:
+                issues.append(f"holders:{row.token_address}: {holder_status.error}")
+        if creator_status is None:
+            creator_status = fetch_creator_status(
+                session,
+                row.token_address,
+                rpc_url,
+                helius_url,
+                timeout,
+            )
+            creator_cache[row.token_address] = creator_status
+            if creator_status.quality in {"unknown", "error"} and creator_status.error:
+                issues.append(f"creator:{row.token_address}: {creator_status.error}")
+        enriched_row = apply_native_edge(enriched_row, holder_status, creator_status)
+        if debug_enrich and debug_enrich_count < 3 and row.token_address not in debug_enrich_mints:
+            print_debug_enrich(row.token_address, holder_status, creator_status)
+            debug_enrich_mints.add(row.token_address)
+            debug_enrich_count += 1
+        enriched_rows.append(enriched_row)
+    rows = enriched_rows
     rows.sort(
         key=lambda row: (
             row.verdict != "SAFE",
@@ -2629,7 +2606,7 @@ def parse_args() -> argparse.Namespace:
 
 def build_session() -> requests.Session:
     session = requests.Session()
-    session.headers.update({"Accept": "application/json", "User-Agent": "ArloBit/0.9.2"})
+    session.headers.update({"Accept": "application/json", "User-Agent": "ArloBit/0.9.4"})
     return session
 
 
