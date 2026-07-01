@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-ArloBit Solana Scanner v0.9.1
+ArloBit Solana Scanner v0.9.2
 
 Scans fresh Solana token profiles/boosts from the free DexScreener API,
 fetches pair details, filters by pairCreatedAt, and prints a compact
-terminal risk table. v0.9.1 tightens holder/creator scoring.
+terminal risk table. v0.9.2 fixes holder/creator enrichment.
 
 This script never trades and never loads private keys.
 """
@@ -187,6 +187,8 @@ class HolderStatus:
     top_20_holders_pct: float | None = None
     status: str = "unknown"
     error: str | None = None
+    method: str | None = None
+    result_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -196,6 +198,7 @@ class CreatorStatus:
     wallet_age_days: float | None = None
     quality: str = "unknown"
     error: str | None = None
+    signature: str | None = None
 
 
 @dataclass(frozen=True)
@@ -400,12 +403,12 @@ def fetch_holder_status_helius(
         session,
         helius_url,
         "getTokenAccounts",
-        {"mint": token_address, "page": 1, "limit": 1000, "options": {"showZeroBalance": False}},
+        {"mint": token_address, "page": 1, "limit": 100, "options": {"showZeroBalance": False}},
         timeout,
     )
     accounts = (result or {}).get("token_accounts") or (result or {}).get("items") or []
     if not isinstance(accounts, list) or not accounts:
-        return HolderStatus(status="unknown", error="helius_no_holder_accounts")
+        return HolderStatus(status="unknown", error="helius_no_holder_accounts", method="helius_getTokenAccounts", result_count=0)
     supply = fetch_token_supply(session, rpc_url, token_address, timeout)
     holder_balances = aggregate_real_wallet_holders(
         session,
@@ -415,8 +418,13 @@ def fetch_holder_status_helius(
     )
     top_1, top_10, top_20 = holder_percentages(holder_balances, supply)
     if top_1 is None or top_10 is None or top_20 is None:
-        return HolderStatus(status="unknown", error="helius_holder_unusable")
-    return HolderStatus(top_1, top_10, top_20, "ok")
+        return HolderStatus(
+            status="unknown",
+            error="helius_holder_unusable",
+            method="helius_getTokenAccounts",
+            result_count=len(accounts),
+        )
+    return HolderStatus(top_1, top_10, top_20, "ok", method="helius_getTokenAccounts", result_count=len(accounts))
 
 
 def enrich_largest_token_accounts(
@@ -452,14 +460,19 @@ def fetch_holder_status_rpc(
     largest = rpc_request(session, rpc_url, "getTokenLargestAccounts", [token_address], timeout)
     accounts = (largest or {}).get("value") or []
     if not isinstance(accounts, list) or not accounts:
-        return HolderStatus(status="unknown", error="rpc_no_largest_accounts")
+        return HolderStatus(status="unknown", error="rpc_no_largest_accounts", method="getTokenLargestAccounts", result_count=0)
     supply = fetch_token_supply(session, rpc_url, token_address, timeout)
     enriched_accounts = enrich_largest_token_accounts(session, rpc_url, accounts, timeout)
     holder_balances = aggregate_real_wallet_holders(session, rpc_url, enriched_accounts, timeout)
     top_1, top_10, top_20 = holder_percentages(holder_balances, supply)
     if top_1 is None or top_10 is None or top_20 is None:
-        return HolderStatus(status="unknown", error="rpc_holder_unusable")
-    return HolderStatus(top_1, top_10, top_20, "ok")
+        return HolderStatus(
+            status="unknown",
+            error="rpc_holder_unusable",
+            method="getTokenLargestAccounts",
+            result_count=len(accounts),
+        )
+    return HolderStatus(top_1, top_10, top_20, "ok", method="getTokenLargestAccounts", result_count=len(accounts))
 
 
 def fetch_holder_status(
@@ -472,9 +485,19 @@ def fetch_holder_status(
     errors: list[str] = []
     if helius_url:
         try:
-            return fetch_holder_status_helius(session, helius_url, rpc_url, token_address, timeout)
+            return fetch_holder_status_rpc(session, helius_url, token_address, timeout)
         except (requests.RequestException, ValueError) as exc:
-            errors.append(f"helius:{exc}")
+            errors.append(f"helius_largest:{exc}")
+        try:
+            return fetch_holder_status_helius(session, helius_url, helius_url, token_address, timeout)
+        except (requests.RequestException, ValueError) as exc:
+            errors.append(f"helius_accounts:{exc}")
+        if rpc_url != helius_url:
+            try:
+                return fetch_holder_status_rpc(session, rpc_url, token_address, timeout)
+            except (requests.RequestException, ValueError) as exc:
+                errors.append(f"rpc:{exc}")
+        return HolderStatus(status="unknown", error=";".join(errors) if errors else "holder_unknown")
     try:
         return fetch_holder_status_rpc(session, rpc_url, token_address, timeout)
     except (requests.RequestException, ValueError) as exc:
@@ -532,6 +555,56 @@ def fetch_helius_asset(
     return result if isinstance(result, dict) else None
 
 
+def account_key_string(value: Any) -> str | None:
+    if isinstance(value, str):
+        return first_string(value)
+    if isinstance(value, dict):
+        return first_string(value.get("pubkey"))
+    return None
+
+
+def transaction_account_keys(transaction: dict[str, Any]) -> list[Any]:
+    tx = transaction.get("transaction") or {}
+    if not isinstance(tx, dict):
+        return []
+    message = tx.get("message") or {}
+    if not isinstance(message, dict):
+        return []
+    account_keys = message.get("accountKeys") or []
+    return account_keys if isinstance(account_keys, list) else []
+
+
+def fetch_creator_from_mint_history(
+    session: requests.Session,
+    rpc_url: str,
+    token_address: str,
+    timeout: int,
+) -> tuple[str | None, str | None, str | None]:
+    options = {"limit": 10, "commitment": "confirmed"}
+    signatures = rpc_request(session, rpc_url, "getSignaturesForAddress", [token_address, options], timeout)
+    if not isinstance(signatures, list) or not signatures:
+        return None, None, "creator_mint_signatures_missing"
+    oldest = signatures[-1] if isinstance(signatures[-1], dict) else {}
+    signature = first_string(oldest.get("signature"))
+    if not signature:
+        return None, None, "creator_mint_signature_unusable"
+    tx_options = {
+        "encoding": "jsonParsed",
+        "commitment": "confirmed",
+        "maxSupportedTransactionVersion": 0,
+    }
+    transaction = rpc_request(session, rpc_url, "getTransaction", [signature, tx_options], timeout)
+    if not isinstance(transaction, dict):
+        return None, signature, "creator_transaction_missing"
+    account_keys = transaction_account_keys(transaction)
+    if not account_keys:
+        return None, signature, "creator_transaction_account_keys_missing"
+    wallet = account_key_string(account_keys[0])
+    if not wallet:
+        return None, signature, "creator_fee_payer_missing"
+    return wallet, signature, None
+
+
 def fetch_sol_balance(session: requests.Session, rpc_url: str, wallet: str, timeout: int) -> float | None:
     result = rpc_request(session, rpc_url, "getBalance", [wallet, {"commitment": "confirmed"}], timeout)
     value = number((result or {}).get("value"), default=-1.0)
@@ -578,35 +651,39 @@ def fetch_creator_status(
     token_address: str,
     rpc_url: str,
     helius_url: str | None,
-    mint_status: MintAuthorityStatus,
     timeout: int,
 ) -> CreatorStatus:
     wallet: str | None = None
+    signature: str | None = None
     errors: list[str] = []
-    if helius_url:
-        try:
-            asset = fetch_helius_asset(session, helius_url, token_address, timeout)
-            wallet = extract_creator_wallet(asset) if asset else None
-            if not asset:
-                errors.append("helius_asset_missing")
-        except (requests.RequestException, ValueError) as exc:
-            errors.append(f"helius_asset:{exc}")
-    else:
-        errors.append("helius_unavailable")
-    if not wallet:
-        wallet = mint_status.mint_authority
-    if not wallet:
-        return CreatorStatus(quality="unknown", error=";".join([*errors, "creator_missing"]))
+    creator_rpc_url = helius_url or rpc_url
     try:
-        balance = fetch_sol_balance(session, rpc_url, wallet, timeout)
+        wallet, signature, error = fetch_creator_from_mint_history(session, creator_rpc_url, token_address, timeout)
+        if error:
+            errors.append(error)
     except (requests.RequestException, ValueError) as exc:
-        return CreatorStatus(wallet=wallet, quality="error", error=f"creator_balance:{exc}")
+        errors.append(f"creator_mint_history:{exc}")
+    if not wallet:
+        return CreatorStatus(quality="unknown", error=";".join([*errors, "creator_missing"]), signature=signature)
     try:
-        age_days = fetch_wallet_age_days(session, rpc_url, wallet, timeout)
+        balance = fetch_sol_balance(session, creator_rpc_url, wallet, timeout)
     except (requests.RequestException, ValueError) as exc:
-        return CreatorStatus(wallet=wallet, sol_balance=balance, quality="error", error=f"creator_age:{exc}")
+        return CreatorStatus(wallet=wallet, quality="error", error=f"creator_balance:{exc}", signature=signature)
+    try:
+        age_days = fetch_wallet_age_days(session, creator_rpc_url, wallet, timeout)
+    except (requests.RequestException, ValueError) as exc:
+        return CreatorStatus(wallet=wallet, sol_balance=balance, quality="error", error=f"creator_age:{exc}", signature=signature)
     quality = creator_quality(balance, age_days)
-    return CreatorStatus(wallet=wallet, sol_balance=balance, wallet_age_days=age_days, quality=quality)
+    if quality == "unknown":
+        errors.append("creator_age_or_balance_unknown")
+    return CreatorStatus(
+        wallet=wallet,
+        sol_balance=balance,
+        wallet_age_days=age_days,
+        quality=quality,
+        error=";".join(errors) if errors else None,
+        signature=signature,
+    )
 
 
 def fetch_mint_account(
@@ -1117,6 +1194,33 @@ def apply_sellability(
     )
 
 
+def debug_percent(value: float | None) -> str:
+    if value is None:
+        return "unknown"
+    return f"{value:.4f}"
+
+
+def print_debug_enrich(mint: str, holder: HolderStatus, creator: CreatorStatus) -> None:
+    holder_unknown_reason = holder.error if holder.status != "ok" else "none"
+    creator_unknown_reason = creator.error if creator.quality in {"unknown", "error"} else "none"
+    print(
+        "[debug-enrich] "
+        f"mint={mint} "
+        f"holder_method={holder.method or 'unknown'} "
+        f"holder_status={holder.status} "
+        f"holder_result_count={holder.result_count if holder.result_count is not None else 'unknown'} "
+        f"top1={debug_percent(holder.top_1_holder_pct)} "
+        f"top10={debug_percent(holder.top_10_holders_pct)} "
+        f"top20={debug_percent(holder.top_20_holders_pct)} "
+        f"holder_unknown_reason={holder_unknown_reason} "
+        f"creator_signature={creator.signature or 'unknown'} "
+        f"creator_wallet={creator.wallet or 'unknown'} "
+        f"creator_age_days={debug_percent(creator.wallet_age_days)} "
+        f"creator_quality={creator.quality} "
+        f"creator_unknown_reason={creator_unknown_reason}"
+    )
+
+
 def collect_rows(
     session: requests.Session,
     limit: int,
@@ -1132,6 +1236,7 @@ def collect_rows(
     rpc_max_delay: float,
     rpc_429_backoff: float,
     helius_url: str | None,
+    debug_enrich: bool = False,
 ) -> tuple[list[PairRow], list[str], int, int]:
     candidates, issues = fetch_candidates(session, timeout)
     now_ms = int(time.time() * 1000)
@@ -1141,6 +1246,7 @@ def collect_rows(
     creator_cache: dict[str, CreatorStatus] = {}
     rows: list[PairRow] = []
     rpc_calls = 0
+    debug_enrich_count = 0
 
     for candidate in candidates[:candidate_limit]:
         mint_status = mint_cache.get(candidate.token_address)
@@ -1158,6 +1264,34 @@ def collect_rows(
             mint_cache[candidate.token_address] = mint_status
             if mint_status.issue:
                 issues.append(f"rpc:{candidate.token_address}: {mint_status.issue}")
+
+        if debug_enrich and debug_enrich_count < 3:
+            holder_status = holder_cache.get(candidate.token_address)
+            if holder_status is None:
+                holder_status = fetch_holder_status(
+                    session,
+                    candidate.token_address,
+                    rpc_url,
+                    helius_url,
+                    timeout,
+                )
+                holder_cache[candidate.token_address] = holder_status
+                if holder_status.status != "ok" and holder_status.error:
+                    issues.append(f"holders:{candidate.token_address}: {holder_status.error}")
+            creator_status = creator_cache.get(candidate.token_address)
+            if creator_status is None:
+                creator_status = fetch_creator_status(
+                    session,
+                    candidate.token_address,
+                    rpc_url,
+                    helius_url,
+                    timeout,
+                )
+                creator_cache[candidate.token_address] = creator_status
+                if creator_status.quality in {"unknown", "error"} and creator_status.error:
+                    issues.append(f"creator:{candidate.token_address}: {creator_status.error}")
+            print_debug_enrich(candidate.token_address, holder_status, creator_status)
+            debug_enrich_count += 1
 
         try:
             pairs = fetch_token_pairs(session, candidate.token_address, timeout)
@@ -1201,7 +1335,6 @@ def collect_rows(
                         candidate.token_address,
                         rpc_url,
                         helius_url,
-                        mint_status,
                         timeout,
                     )
                     holder_cache[candidate.token_address] = holder_status
@@ -2341,12 +2474,17 @@ def parse_args() -> argparse.Namespace:
         default=positive_int(os.environ.get("TELEGRAM_ALERT_LIMIT_PER_HOUR", str(DEFAULT_TELEGRAM_ALERT_LIMIT_PER_HOUR))),
         help="maximum Telegram messages per hour across alerts and paper trade messages",
     )
+    parser.add_argument(
+        "--debug-enrich",
+        action="store_true",
+        help="print sanitized holder/creator enrichment details for the first 3 candidates",
+    )
     return parser.parse_args()
 
 
 def build_session() -> requests.Session:
     session = requests.Session()
-    session.headers.update({"Accept": "application/json", "User-Agent": "ArloBit/0.9.1"})
+    session.headers.update({"Accept": "application/json", "User-Agent": "ArloBit/0.9.2"})
     return session
 
 
@@ -2398,6 +2536,7 @@ def run_scan_once(args: argparse.Namespace) -> ScanResult:
         rpc_max_delay=args.rpc_max_delay,
         rpc_429_backoff=args.rpc_429_backoff,
         helius_url=helius_rpc_url(os.environ.get("HELIUS_API_KEY")),
+        debug_enrich=args.debug_enrich,
     )
 
     print(render_table(rows))
