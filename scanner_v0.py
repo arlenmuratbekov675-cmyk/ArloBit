@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-ArloBit Solana Scanner v0.9
+ArloBit Solana Scanner v0.9.1
 
 Scans fresh Solana token profiles/boosts from the free DexScreener API,
 fetches pair details, filters by pairCreatedAt, and prints a compact
-terminal risk table. v0.9 adds Solana-native holder/creator scoring.
+terminal risk table. v0.9.1 tightens holder/creator scoring.
 
 This script never trades and never loads private keys.
 """
@@ -49,6 +49,7 @@ PAPER_TRADES_CSV_FILE = "paper_trades.csv"
 DEFAULT_LOOP_INTERVAL_SECONDS = 180
 DEFAULT_JUPITER_SELL_AMOUNT_RAW = 1_000_000
 MAX_PAPER_ENTRIES_PER_HOUR = 2
+NATIVE_EDGE_CHECK_DELAY_SECONDS = 0.5
 
 DEFAULT_MIN_AGE_MINUTES = 10
 DEFAULT_MAX_AGE_HOURS = 24
@@ -73,13 +74,28 @@ BLOCKED_PAPER_REASONS = (
     "honeypot_no_route",
     "sell_impact_too_high",
     "sellability_unknown",
-    "holder_data_unknown",
-    "holder_concentration_high",
-    "creator_unknown",
+    "blocked_holder_unknown",
+    "blocked_creator_unknown",
+    "blocked_score_unavailable",
+    "scam_holder",
+    "scam_creator",
+    "risky_holder",
     "creator_risky",
     "score_too_low",
     "paper_entry_hourly_limit",
 )
+KNOWN_NON_WALLET_HOLDERS = {
+    "11111111111111111111111111111111",
+    "1nc1nerator11111111111111111111111111111111",
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+    "9W959DqEETiGZocYWCQPaJ6vGgFbkYQM7HwxV23cw3kF",
+    "whirLbMiicVdio4qvUfM5KAg6Ct8VgVwfmJw7pN5G6C",
+    "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
+    "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+    "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB",
+    "MeteoraDLMMProgram1111111111111111111111111111",
+}
 MIN_SAFE_PRICE_CHANGE_5M = -30
 EXTREME_PUMP_5M = 150
 SPL_MINT_ACCOUNT_MIN_SIZE = 82
@@ -141,7 +157,7 @@ class PairRow:
     sell_price_impact_pct: float | None
     sell_route_found: bool
     sell_check_error: str | None
-    arlobit_score: int
+    arlobit_score: float
     top_1_holder_pct: float | None
     top_10_holders_pct: float | None
     top_20_holders_pct: float | None
@@ -187,6 +203,7 @@ class MintAuthorityStatus:
     mint_authority_active: bool | None
     freeze_authority_active: bool | None
     issue: str | None = None
+    mint_authority: str | None = None
 
 
 @dataclass(frozen=True)
@@ -225,6 +242,24 @@ def as_items(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
+BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def base58_encode(raw: bytes) -> str:
+    value = int.from_bytes(raw, "big")
+    encoded = ""
+    while value:
+        value, remainder = divmod(value, 58)
+        encoded = BASE58_ALPHABET[remainder] + encoded
+    padding = 0
+    for byte in raw:
+        if byte == 0:
+            padding += 1
+        else:
+            break
+    return "1" * padding + (encoded or "1")
+
+
 def rpc_request(
     session: requests.Session,
     rpc_url: str,
@@ -259,10 +294,87 @@ def token_amount_raw(item: dict[str, Any]) -> float:
     return 0.0
 
 
-def holder_percentages(amounts: list[float], supply: float) -> tuple[float | None, float | None, float | None]:
-    if supply <= 0 or not amounts:
+def token_account_owner(item: dict[str, Any]) -> str | None:
+    for key in ("owner", "ownerAddress", "owner_address"):
+        owner = first_string(item.get(key))
+        if owner:
+            return owner
+    account = item.get("account") or {}
+    data = (account.get("data") or {}) if isinstance(account, dict) else {}
+    parsed = (data.get("parsed") or {}) if isinstance(data, dict) else {}
+    info = (parsed.get("info") or {}) if isinstance(parsed, dict) else {}
+    return first_string(info.get("owner"))
+
+
+def token_account_amount(item: dict[str, Any]) -> float:
+    account = item.get("account") or {}
+    data = (account.get("data") or {}) if isinstance(account, dict) else {}
+    parsed = (data.get("parsed") or {}) if isinstance(data, dict) else {}
+    info = (parsed.get("info") or {}) if isinstance(parsed, dict) else {}
+    token_amount = (info.get("tokenAmount") or {}) if isinstance(info, dict) else {}
+    if isinstance(token_amount, dict):
+        amount = number(token_amount.get("amount"), default=-1.0)
+        if amount >= 0:
+            return amount
+    return token_amount_raw(item)
+
+
+def is_known_non_wallet(address: str | None) -> bool:
+    return not address or address in KNOWN_NON_WALLET_HOLDERS
+
+
+def account_is_program_owned(account: dict[str, Any] | None) -> bool:
+    if not isinstance(account, dict):
+        return False
+    if account.get("executable") is True:
+        return True
+    return str(account.get("owner") or "") in KNOWN_NON_WALLET_HOLDERS
+
+
+def fetch_program_owned_addresses(
+    session: requests.Session,
+    rpc_url: str,
+    addresses: list[str],
+    timeout: int,
+) -> set[str]:
+    program_owned: set[str] = set()
+    unique_addresses = [address for address in dict.fromkeys(addresses) if not is_known_non_wallet(address)]
+    for index in range(0, len(unique_addresses), 100):
+        chunk = unique_addresses[index : index + 100]
+        result = rpc_request(session, rpc_url, "getMultipleAccounts", [chunk, {"encoding": "jsonParsed"}], timeout)
+        values = (result or {}).get("value") or []
+        if not isinstance(values, list):
+            continue
+        for address, account in zip(chunk, values, strict=False):
+            if account_is_program_owned(account):
+                program_owned.add(address)
+    return program_owned
+
+
+def aggregate_real_wallet_holders(
+    session: requests.Session,
+    rpc_url: str,
+    accounts: list[dict[str, Any]],
+    timeout: int,
+) -> dict[str, float]:
+    balances: dict[str, float] = {}
+    for account in accounts:
+        owner = token_account_owner(account)
+        if is_known_non_wallet(owner):
+            continue
+        amount = token_account_amount(account)
+        if owner and amount > 0:
+            balances[owner] = balances.get(owner, 0.0) + amount
+    program_owned = fetch_program_owned_addresses(session, rpc_url, list(balances), timeout)
+    for address in program_owned:
+        balances.pop(address, None)
+    return balances
+
+
+def holder_percentages(holder_balances: dict[str, float], supply: float) -> tuple[float | None, float | None, float | None]:
+    if supply <= 0 or not holder_balances:
         return None, None, None
-    ordered = sorted((amount for amount in amounts if amount > 0), reverse=True)
+    ordered = sorted((amount for amount in holder_balances.values() if amount > 0), reverse=True)
     if not ordered:
         return None, None, None
     top_1 = ordered[0] / supply * 100
@@ -295,13 +407,40 @@ def fetch_holder_status_helius(
     if not isinstance(accounts, list) or not accounts:
         return HolderStatus(status="unknown", error="helius_no_holder_accounts")
     supply = fetch_token_supply(session, rpc_url, token_address, timeout)
-    top_1, top_10, top_20 = holder_percentages(
-        [token_amount_raw(account) for account in accounts if isinstance(account, dict)],
-        supply,
+    holder_balances = aggregate_real_wallet_holders(
+        session,
+        rpc_url,
+        [account for account in accounts if isinstance(account, dict)],
+        timeout,
     )
+    top_1, top_10, top_20 = holder_percentages(holder_balances, supply)
     if top_1 is None or top_10 is None or top_20 is None:
         return HolderStatus(status="unknown", error="helius_holder_unusable")
     return HolderStatus(top_1, top_10, top_20, "ok")
+
+
+def enrich_largest_token_accounts(
+    session: requests.Session,
+    rpc_url: str,
+    largest_accounts: list[dict[str, Any]],
+    timeout: int,
+) -> list[dict[str, Any]]:
+    addresses = [str(account.get("address") or "") for account in largest_accounts if isinstance(account, dict)]
+    addresses = [address for address in addresses if address]
+    if not addresses:
+        return []
+    result = rpc_request(session, rpc_url, "getMultipleAccounts", [addresses, {"encoding": "jsonParsed"}], timeout)
+    values = (result or {}).get("value") or []
+    if not isinstance(values, list):
+        return []
+    enriched: list[dict[str, Any]] = []
+    for source, account in zip(largest_accounts, values, strict=False):
+        if not isinstance(source, dict) or not isinstance(account, dict):
+            continue
+        row = dict(source)
+        row["account"] = account
+        enriched.append(row)
+    return enriched
 
 
 def fetch_holder_status_rpc(
@@ -315,10 +454,9 @@ def fetch_holder_status_rpc(
     if not isinstance(accounts, list) or not accounts:
         return HolderStatus(status="unknown", error="rpc_no_largest_accounts")
     supply = fetch_token_supply(session, rpc_url, token_address, timeout)
-    top_1, top_10, top_20 = holder_percentages(
-        [token_amount_raw(account) for account in accounts if isinstance(account, dict)],
-        supply,
-    )
+    enriched_accounts = enrich_largest_token_accounts(session, rpc_url, accounts, timeout)
+    holder_balances = aggregate_real_wallet_holders(session, rpc_url, enriched_accounts, timeout)
+    top_1, top_10, top_20 = holder_percentages(holder_balances, supply)
     if top_1 is None or top_10 is None or top_20 is None:
         return HolderStatus(status="unknown", error="rpc_holder_unusable")
     return HolderStatus(top_1, top_10, top_20, "ok")
@@ -403,20 +541,26 @@ def fetch_sol_balance(session: requests.Session, rpc_url: str, wallet: str, time
 
 
 def fetch_wallet_age_days(session: requests.Session, rpc_url: str, wallet: str, timeout: int) -> float | None:
-    result = rpc_request(
-        session,
-        rpc_url,
-        "getSignaturesForAddress",
-        [wallet, {"limit": 1000, "commitment": "confirmed"}],
-        timeout,
-    )
-    if not isinstance(result, list) or not result:
+    before: str | None = None
+    oldest_block_time: int | None = None
+    for _ in range(25):
+        options: dict[str, Any] = {"limit": 1000, "commitment": "confirmed"}
+        if before:
+            options["before"] = before
+        result = rpc_request(session, rpc_url, "getSignaturesForAddress", [wallet, options], timeout)
+        if not isinstance(result, list) or not result:
+            break
+        for item in result:
+            if isinstance(item, dict) and item.get("blockTime"):
+                block_time = int(item["blockTime"])
+                oldest_block_time = block_time if oldest_block_time is None else min(oldest_block_time, block_time)
+        last_signature = result[-1].get("signature") if isinstance(result[-1], dict) else None
+        if not last_signature or len(result) < 1000:
+            break
+        before = str(last_signature)
+    if oldest_block_time is None:
         return None
-    block_times = [int(item.get("blockTime")) for item in result if isinstance(item, dict) and item.get("blockTime")]
-    if not block_times:
-        return None
-    oldest_seen = min(block_times)
-    return max(0.0, (time.time() - oldest_seen) / 86_400)
+    return max(0.0, (time.time() - oldest_block_time) / 86_400)
 
 
 def creator_quality(balance: float | None, age_days: float | None) -> str:
@@ -434,19 +578,25 @@ def fetch_creator_status(
     token_address: str,
     rpc_url: str,
     helius_url: str | None,
+    mint_status: MintAuthorityStatus,
     timeout: int,
 ) -> CreatorStatus:
-    if not helius_url:
-        return CreatorStatus(quality="unknown", error="helius_unavailable")
-    try:
-        asset = fetch_helius_asset(session, helius_url, token_address, timeout)
-    except (requests.RequestException, ValueError) as exc:
-        return CreatorStatus(quality="error", error=f"helius_asset:{exc}")
-    if not asset:
-        return CreatorStatus(quality="unknown", error="helius_asset_missing")
-    wallet = extract_creator_wallet(asset)
+    wallet: str | None = None
+    errors: list[str] = []
+    if helius_url:
+        try:
+            asset = fetch_helius_asset(session, helius_url, token_address, timeout)
+            wallet = extract_creator_wallet(asset) if asset else None
+            if not asset:
+                errors.append("helius_asset_missing")
+        except (requests.RequestException, ValueError) as exc:
+            errors.append(f"helius_asset:{exc}")
+    else:
+        errors.append("helius_unavailable")
     if not wallet:
-        return CreatorStatus(quality="unknown", error="creator_missing")
+        wallet = mint_status.mint_authority
+    if not wallet:
+        return CreatorStatus(quality="unknown", error=";".join([*errors, "creator_missing"]))
     try:
         balance = fetch_sol_balance(session, rpc_url, wallet, timeout)
     except (requests.RequestException, ValueError) as exc:
@@ -527,6 +677,7 @@ def parse_spl_mint_account(raw: bytes) -> MintAuthorityStatus:
     return MintAuthorityStatus(
         mint_authority_active=mint_authority_option == 1,
         freeze_authority_active=freeze_authority_option == 1,
+        mint_authority=base58_encode(raw[4:36]) if mint_authority_option == 1 else None,
     )
 
 
@@ -804,8 +955,8 @@ def score_pair(
     return "SAFE", ("fresh",)
 
 
-def arlobit_score(row: PairRow, holder: HolderStatus, creator: CreatorStatus) -> int:
-    score = 0
+def arlobit_score(row: PairRow, holder: HolderStatus, creator: CreatorStatus) -> float:
+    score = 0.0
     if holder.status == "ok" and holder.top_10_holders_pct is not None and holder.top_10_holders_pct < 30:
         score += 3
     if creator.wallet_age_days is not None and creator.wallet_age_days > 30:
@@ -816,8 +967,10 @@ def arlobit_score(row: PairRow, holder: HolderStatus, creator: CreatorStatus) ->
         score += 1
     if row.sellable == "yes" and row.sell_price_impact_pct is not None and row.sell_price_impact_pct <= 15:
         score += 1
-    if row.mint_authority_active is False and row.freeze_authority_active is False:
-        score += 1
+    if row.mint_authority_active is False:
+        score += 0.5
+    if row.freeze_authority_active is False:
+        score += 0.5
     return score
 
 
@@ -826,25 +979,25 @@ def apply_native_edge(row: PairRow, holder: HolderStatus, creator: CreatorStatus
     risk: list[str] = []
 
     if holder.status != "ok":
-        risk.append("holder_data_unknown")
+        risk.append("blocked_holder_unknown")
     else:
         if holder.top_1_holder_pct is not None and holder.top_1_holder_pct > 20:
-            danger.append("top1_holder_high")
+            danger.append("scam_holder")
         if holder.top_10_holders_pct is not None:
             if holder.top_10_holders_pct > 60:
-                danger.append("top10_holders_extreme")
+                danger.append("scam_holder")
             elif holder.top_10_holders_pct > 40:
-                risk.append("top10_holders_high")
+                risk.append("risky_holder")
 
     if creator.quality in {"unknown", "error"}:
-        risk.append("creator_unknown")
+        risk.append("blocked_creator_unknown")
     else:
         if creator.wallet_age_days is not None and creator.wallet_age_days < 1:
-            danger.append("creator_age_under_1d")
+            danger.append("scam_creator")
         elif creator.wallet_age_days is not None and creator.wallet_age_days < 7:
             risk.append("creator_age_under_7d")
         if creator.sol_balance is not None and creator.sol_balance < 0.1:
-            danger.append("creator_low_sol")
+            danger.append("scam_creator")
 
     if danger:
         verdict = "SCAM_LIKELY"
@@ -1040,6 +1193,7 @@ def collect_rows(
                 if sellability.sellable == "unknown" and sellability.error:
                     issues.append(f"jupiter:{candidate.token_address}: {sellability.error}")
             if row.verdict == "SAFE":
+                time.sleep(NATIVE_EDGE_CHECK_DELAY_SECONDS)
                 holder_status = holder_cache.get(candidate.token_address)
                 if holder_status is None:
                     holder_status = fetch_holder_status(
@@ -1047,6 +1201,7 @@ def collect_rows(
                         candidate.token_address,
                         rpc_url,
                         helius_url,
+                        mint_status,
                         timeout,
                     )
                     holder_cache[candidate.token_address] = holder_status
@@ -1133,6 +1288,12 @@ def percent_status(value: Any) -> str:
     return f"{number(value):.2f}%"
 
 
+def age_days_status(value: Any) -> str:
+    if value is None:
+        return "unknown"
+    return f"{number(value):.1f}d"
+
+
 def telegram_alert_enabled() -> tuple[bool, str | None, str | None]:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
@@ -1184,18 +1345,25 @@ def paper_entry_blocked_reasons(row: PairRow) -> list[str]:
     elif row.sell_price_impact_pct is not None and row.sell_price_impact_pct > 15:
         reasons.append("sell_impact_too_high")
     if row.holder_data_status != "ok":
-        reasons.append("holder_data_unknown")
+        reasons.append("blocked_holder_unknown")
+        reasons.append("blocked_score_unavailable")
     elif row.top_1_holder_pct is not None and row.top_1_holder_pct > 20:
-        reasons.append("holder_concentration_high")
+        reasons.append("scam_holder")
     elif row.top_10_holders_pct is not None and row.top_10_holders_pct > 40:
-        reasons.append("holder_concentration_high")
+        reasons.append("scam_holder" if row.top_10_holders_pct > 60 else "risky_holder")
     if row.creator_quality in {"unknown", "error"}:
-        reasons.append("creator_unknown")
+        reasons.append("blocked_creator_unknown")
+        reasons.append("blocked_score_unavailable")
     elif row.creator_quality == "risky":
         reasons.append("creator_risky")
+        if (
+            (row.creator_wallet_age_days is not None and row.creator_wallet_age_days < 1)
+            or (row.creator_sol_balance is not None and row.creator_sol_balance < 0.1)
+        ):
+            reasons.append("scam_creator")
     if row.arlobit_score < 6:
         reasons.append("score_too_low")
-    return reasons
+    return list(dict.fromkeys(reasons))
 
 
 def count_blocked_paper_reasons(rows: list[PairRow]) -> dict[str, int]:
@@ -1219,13 +1387,11 @@ def telegram_message(row: PairRow) -> str:
             f"Price change 5m: {row.price_change_5m:.2f}%",
             f"Sellable: {row.sellable}",
             f"Sell impact: {percent_status(row.sell_price_impact_pct)}",
-            f"Score: {row.arlobit_score}",
-            f"Holder top1/top10/top20: "
-            f"{percent_status(row.top_1_holder_pct)} / "
-            f"{percent_status(row.top_10_holders_pct)} / "
-            f"{percent_status(row.top_20_holders_pct)}",
+            f"ArloBit score: {row.arlobit_score:.1f}",
+            f"Top10 holders: {percent_status(row.top_10_holders_pct)}",
             f"Holder data: {row.holder_data_status}",
             f"Creator quality: {row.creator_quality}",
+            f"Creator wallet age: {age_days_status(row.creator_wallet_age_days)}",
             f"DexScreener: {row.dex_url}",
             f"Verdict: {row.verdict}",
             f"Signals: {', '.join(row.signals)}",
@@ -1243,7 +1409,7 @@ def paper_open_message(trade: dict[str, Any]) -> str:
             f"Liquidity: {money(number(trade.get('liquidity_at_entry')))}",
             f"Sellable: {trade.get('sellable', 'unknown')}",
             f"Sell impact: {percent_status(trade.get('sell_price_impact_pct'))}",
-            f"Score: {int(number(trade.get('arlobit_score')))}",
+            f"Score: {number(trade.get('arlobit_score')):.1f}",
             f"Holder top10: {percent_status(trade.get('top_10_holders_pct'))}",
             f"Creator quality: {trade.get('creator_quality', 'unknown')}",
             f"Source: {trade.get('source', 'unknown')}",
@@ -1345,10 +1511,8 @@ DANGER_SIGNAL_NAMES = {
     "freeze_auth_active",
     "honeypot_no_route",
     "sell_impact_extreme",
-    "top1_holder_high",
-    "top10_holders_extreme",
-    "creator_age_under_1d",
-    "creator_low_sol",
+    "scam_holder",
+    "scam_creator",
 }
 
 
@@ -1367,9 +1531,10 @@ RISK_SIGNAL_NAMES = {
     "honeypot_no_route",
     "sell_impact_too_high",
     "sellability_unknown",
-    "holder_data_unknown",
-    "top10_holders_high",
-    "creator_unknown",
+    "blocked_holder_unknown",
+    "blocked_creator_unknown",
+    "blocked_score_unavailable",
+    "risky_holder",
     "creator_age_under_7d",
     "rpc_429",
     "rpc_failed",
@@ -1693,10 +1858,10 @@ def render_table(rows: list[PairRow]) -> str:
         "sellable",
         "sell_impact",
         "score",
-        "top1_holder_pct",
-        "top10_holder_pct",
+        "top1_pct",
+        "top10_pct",
         "creator_quality",
-        "holder_data_status",
+        "holder_status",
         "verdict",
         "signals",
     ]
@@ -1713,7 +1878,7 @@ def render_table(rows: list[PairRow]) -> str:
             bool_status(row.freeze_authority_active),
             row.sellable,
             percent_status(row.sell_price_impact_pct),
-            str(row.arlobit_score),
+            f"{row.arlobit_score:.1f}",
             percent_status(row.top_1_holder_pct),
             percent_status(row.top_10_holders_pct),
             row.creator_quality,
@@ -1826,14 +1991,14 @@ def volume_liquidity_ratio_bucket(trade: dict[str, Any]) -> str:
 
 
 def score_bucket(trade: dict[str, Any]) -> str:
-    score = int(number(trade.get("arlobit_score")))
+    score = number(trade.get("arlobit_score"))
     if score < 4:
-        return "<4"
+        return "0-4"
     if score < 6:
-        return "4-5"
+        return "4-6"
     if score < 8:
-        return "6-7"
-    return ">=8"
+        return "6-8"
+    return "8+"
 
 
 def holder_concentration_bucket(trade: dict[str, Any]) -> str:
@@ -2181,7 +2346,7 @@ def parse_args() -> argparse.Namespace:
 
 def build_session() -> requests.Session:
     session = requests.Session()
-    session.headers.update({"Accept": "application/json", "User-Agent": "ArloBit/0.9"})
+    session.headers.update({"Accept": "application/json", "User-Agent": "ArloBit/0.9.1"})
     return session
 
 
