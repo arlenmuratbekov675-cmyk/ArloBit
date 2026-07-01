@@ -246,6 +246,63 @@ def as_items(payload: Any) -> list[dict[str, Any]]:
 
 
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+BASE58_INDEX = {character: index for index, character in enumerate(BASE58_ALPHABET)}
+
+
+def base58_decode(value: str) -> bytes | None:
+    decoded = 0
+    for character in value:
+        digit = BASE58_INDEX.get(character)
+        if digit is None:
+            return None
+        decoded = decoded * 58 + digit
+    raw = decoded.to_bytes((decoded.bit_length() + 7) // 8, "big") if decoded else b""
+    padding = 0
+    for character in value:
+        if character == "1":
+            padding += 1
+        else:
+            break
+    return b"\x00" * padding + raw
+
+
+def is_valid_solana_pubkey(value: str | None) -> bool:
+    if not isinstance(value, str):
+        return False
+    address = value.strip()
+    if not address or address != value:
+        return False
+    decoded = base58_decode(address)
+    return decoded is not None and len(decoded) == 32
+
+
+def safe_pubkey(value: Any) -> str:
+    text = str(value or "")
+    if len(text) <= 14:
+        return text
+    return f"{text[:6]}...{text[-6:]}"
+
+
+def sanitize_rpc_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return safe_pubkey(value)
+    if isinstance(value, list):
+        return [sanitize_rpc_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): sanitize_rpc_value(item) for key, item in value.items()}
+    return value
+
+
+def print_rpc_error_debug(method: str, params: list[Any] | dict[str, Any], http_status: int | str, body: Any, error: Any) -> None:
+    print(
+        "[rpc-debug] "
+        f"method={method} "
+        f"params={json.dumps(sanitize_rpc_value(params), sort_keys=True)} "
+        f"http_status={http_status} "
+        f"http_response={json.dumps(sanitize_rpc_value(body), sort_keys=True)} "
+        f"rpc_error={json.dumps(sanitize_rpc_value(error), sort_keys=True)}",
+        file=sys.stderr,
+    )
 
 
 def base58_encode(raw: bytes) -> str:
@@ -275,6 +332,7 @@ def rpc_request(
     response.raise_for_status()
     rpc_payload = response.json()
     if rpc_payload.get("error"):
+        print_rpc_error_debug(method, params, response.status_code, rpc_payload, rpc_payload.get("error"))
         message = (rpc_payload.get("error") or {}).get("message", "unknown")
         raise requests.RequestException(f"{method}:{message}")
     return rpc_payload.get("result")
@@ -341,7 +399,11 @@ def fetch_program_owned_addresses(
     timeout: int,
 ) -> set[str]:
     program_owned: set[str] = set()
-    unique_addresses = [address for address in dict.fromkeys(addresses) if not is_known_non_wallet(address)]
+    unique_addresses = [
+        address
+        for address in dict.fromkeys(addresses)
+        if not is_known_non_wallet(address) and is_valid_solana_pubkey(address)
+    ]
     for index in range(0, len(unique_addresses), 100):
         chunk = unique_addresses[index : index + 100]
         result = rpc_request(session, rpc_url, "getMultipleAccounts", [chunk, {"encoding": "jsonParsed"}], timeout)
@@ -387,6 +449,8 @@ def holder_percentages(holder_balances: dict[str, float], supply: float) -> tupl
 
 
 def fetch_token_supply(session: requests.Session, rpc_url: str, token_address: str, timeout: int) -> float:
+    if not is_valid_solana_pubkey(token_address):
+        raise ValueError(f"invalid_mint:{safe_pubkey(token_address)}")
     result = rpc_request(session, rpc_url, "getTokenSupply", [token_address], timeout)
     value = (result or {}).get("value") or {}
     return number(value.get("amount"))
@@ -399,6 +463,13 @@ def fetch_holder_status_helius(
     token_address: str,
     timeout: int,
 ) -> HolderStatus:
+    if not is_valid_solana_pubkey(token_address):
+        return HolderStatus(
+            status="unknown",
+            error=f"invalid_mint:{safe_pubkey(token_address)}",
+            method="helius_getTokenAccounts",
+            result_count=0,
+        )
     result = rpc_request(
         session,
         helius_url,
@@ -434,7 +505,7 @@ def enrich_largest_token_accounts(
     timeout: int,
 ) -> list[dict[str, Any]]:
     addresses = [str(account.get("address") or "") for account in largest_accounts if isinstance(account, dict)]
-    addresses = [address for address in addresses if address]
+    addresses = [address for address in addresses if is_valid_solana_pubkey(address)]
     if not addresses:
         return []
     result = rpc_request(session, rpc_url, "getMultipleAccounts", [addresses, {"encoding": "jsonParsed"}], timeout)
@@ -457,6 +528,13 @@ def fetch_holder_status_rpc(
     token_address: str,
     timeout: int,
 ) -> HolderStatus:
+    if not is_valid_solana_pubkey(token_address):
+        return HolderStatus(
+            status="unknown",
+            error=f"invalid_mint:{safe_pubkey(token_address)}",
+            method="getTokenLargestAccounts",
+            result_count=0,
+        )
     largest = rpc_request(session, rpc_url, "getTokenLargestAccounts", [token_address], timeout)
     accounts = (largest or {}).get("value") or []
     if not isinstance(accounts, list) or not accounts:
@@ -551,6 +629,8 @@ def fetch_helius_asset(
     token_address: str,
     timeout: int,
 ) -> dict[str, Any] | None:
+    if not is_valid_solana_pubkey(token_address):
+        raise ValueError(f"invalid_mint:{safe_pubkey(token_address)}")
     result = rpc_request(session, helius_url, "getAsset", {"id": token_address}, timeout)
     return result if isinstance(result, dict) else None
 
@@ -580,6 +660,8 @@ def fetch_creator_from_mint_history(
     token_address: str,
     timeout: int,
 ) -> tuple[str | None, str | None, str | None]:
+    if not is_valid_solana_pubkey(token_address):
+        return None, None, f"invalid_mint:{safe_pubkey(token_address)}"
     options = {"limit": 10, "commitment": "confirmed"}
     signatures = rpc_request(session, rpc_url, "getSignaturesForAddress", [token_address, options], timeout)
     if not isinstance(signatures, list) or not signatures:
@@ -606,6 +688,8 @@ def fetch_creator_from_mint_history(
 
 
 def fetch_sol_balance(session: requests.Session, rpc_url: str, wallet: str, timeout: int) -> float | None:
+    if not is_valid_solana_pubkey(wallet):
+        raise ValueError(f"invalid_wallet:{safe_pubkey(wallet)}")
     result = rpc_request(session, rpc_url, "getBalance", [wallet, {"commitment": "confirmed"}], timeout)
     value = number((result or {}).get("value"), default=-1.0)
     if value < 0:
@@ -614,6 +698,8 @@ def fetch_sol_balance(session: requests.Session, rpc_url: str, wallet: str, time
 
 
 def fetch_wallet_age_days(session: requests.Session, rpc_url: str, wallet: str, timeout: int) -> float | None:
+    if not is_valid_solana_pubkey(wallet):
+        raise ValueError(f"invalid_wallet:{safe_pubkey(wallet)}")
     before: str | None = None
     oldest_block_time: int | None = None
     for _ in range(25):
@@ -693,6 +779,8 @@ def fetch_mint_account(
     timeout: int,
     retry_backoff: float = RPC_429_BACKOFF_SECONDS,
 ) -> MintAuthorityStatus:
+    if not is_valid_solana_pubkey(token_address):
+        return MintAuthorityStatus(None, None, f"invalid_mint:{safe_pubkey(token_address)}")
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -724,6 +812,7 @@ def fetch_mint_account(
 
     if rpc_payload.get("error"):
         message = rpc_payload["error"].get("message", "unknown")
+        print_rpc_error_debug("getAccountInfo", payload["params"], response.status_code, rpc_payload, rpc_payload.get("error"))
         return MintAuthorityStatus(None, None, f"rpc_error:{message}")
 
     value = (rpc_payload.get("result") or {}).get("value")
@@ -779,6 +868,9 @@ def fetch_candidates(session: requests.Session, timeout: int) -> tuple[list[Cand
                 continue
             token_address = str(item.get("tokenAddress") or "").strip()
             if not token_address or token_address in seen:
+                continue
+            if not is_valid_solana_pubkey(token_address):
+                issues.append(f"{source}: invalid_mint_skipped:{safe_pubkey(token_address)}")
                 continue
             seen.add(token_address)
             candidates.append(Candidate(token_address=token_address, source=source))
