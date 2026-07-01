@@ -305,6 +305,31 @@ def print_rpc_error_debug(method: str, params: list[Any] | dict[str, Any], http_
     )
 
 
+def log(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
+PRINTED_LARGEST_ACCOUNTS_DEBUG = False
+
+
+def rpc_request_payload(
+    session: requests.Session,
+    rpc_url: str,
+    method: str,
+    params: list[Any] | dict[str, Any],
+    timeout: int,
+) -> dict[str, Any]:
+    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    response = session.post(rpc_url, json=payload, timeout=timeout)
+    response.raise_for_status()
+    rpc_payload = response.json()
+    if rpc_payload.get("error"):
+        print_rpc_error_debug(method, params, response.status_code, rpc_payload, rpc_payload.get("error"))
+        message = (rpc_payload.get("error") or {}).get("message", "unknown")
+        raise requests.RequestException(f"{method}:{message}")
+    return rpc_payload
+
+
 def base58_encode(raw: bytes) -> str:
     value = int.from_bytes(raw, "big")
     encoded = ""
@@ -327,14 +352,7 @@ def rpc_request(
     params: list[Any] | dict[str, Any],
     timeout: int,
 ) -> Any:
-    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-    response = session.post(rpc_url, json=payload, timeout=timeout)
-    response.raise_for_status()
-    rpc_payload = response.json()
-    if rpc_payload.get("error"):
-        print_rpc_error_debug(method, params, response.status_code, rpc_payload, rpc_payload.get("error"))
-        message = (rpc_payload.get("error") or {}).get("message", "unknown")
-        raise requests.RequestException(f"{method}:{message}")
+    rpc_payload = rpc_request_payload(session, rpc_url, method, params, timeout)
     return rpc_payload.get("result")
 
 
@@ -355,6 +373,23 @@ def token_amount_raw(item: dict[str, Any]) -> float:
     return 0.0
 
 
+def token_ui_amount_from_fields(fields: dict[str, Any]) -> float | None:
+    ui_amount = fields.get("uiAmount")
+    if ui_amount is not None:
+        return number(ui_amount, default=0.0)
+    ui_amount_string = fields.get("uiAmountString")
+    if ui_amount_string is not None:
+        return number(ui_amount_string, default=0.0)
+    amount = fields.get("amount")
+    decimals = fields.get("decimals")
+    if amount is None or decimals is None:
+        return None
+    try:
+        return number(amount) / (10 ** int(decimals))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def token_account_owner(item: dict[str, Any]) -> str | None:
     for key in ("owner", "ownerAddress", "owner_address"):
         owner = first_string(item.get(key))
@@ -368,16 +403,19 @@ def token_account_owner(item: dict[str, Any]) -> str | None:
 
 
 def token_account_amount(item: dict[str, Any]) -> float:
+    direct_amount = token_ui_amount_from_fields(item)
+    if direct_amount is not None:
+        return direct_amount
     account = item.get("account") or {}
     data = (account.get("data") or {}) if isinstance(account, dict) else {}
     parsed = (data.get("parsed") or {}) if isinstance(data, dict) else {}
     info = (parsed.get("info") or {}) if isinstance(parsed, dict) else {}
     token_amount = (info.get("tokenAmount") or {}) if isinstance(info, dict) else {}
     if isinstance(token_amount, dict):
-        amount = number(token_amount.get("amount"), default=-1.0)
-        if amount >= 0:
-            return amount
-    return token_amount_raw(item)
+        parsed_amount = token_ui_amount_from_fields(token_amount)
+        if parsed_amount is not None:
+            return parsed_amount
+    return 0.0
 
 
 def is_known_non_wallet(address: str | None) -> bool:
@@ -453,7 +491,10 @@ def fetch_token_supply(session: requests.Session, rpc_url: str, token_address: s
         raise ValueError(f"invalid_mint:{safe_pubkey(token_address)}")
     result = rpc_request(session, rpc_url, "getTokenSupply", [token_address], timeout)
     value = (result or {}).get("value") or {}
-    return number(value.get("amount"))
+    supply = token_ui_amount_from_fields(value)
+    if supply is None:
+        raise ValueError(f"supply_decimals_missing:{safe_pubkey(token_address)}")
+    return supply
 
 
 def fetch_holder_status_helius(
@@ -528,6 +569,7 @@ def fetch_holder_status_rpc(
     token_address: str,
     timeout: int,
 ) -> HolderStatus:
+    global PRINTED_LARGEST_ACCOUNTS_DEBUG
     if not is_valid_solana_pubkey(token_address):
         return HolderStatus(
             status="unknown",
@@ -535,8 +577,12 @@ def fetch_holder_status_rpc(
             method="getTokenLargestAccounts",
             result_count=0,
         )
-    largest = rpc_request(session, rpc_url, "getTokenLargestAccounts", [token_address], timeout)
-    accounts = (largest or {}).get("value") or []
+    response = rpc_request_payload(session, rpc_url, "getTokenLargestAccounts", [token_address], timeout)
+    if not PRINTED_LARGEST_ACCOUNTS_DEBUG:
+        log(f"getTokenLargestAccounts raw response for mint {token_address}: {json.dumps(response, sort_keys=True)}")
+        PRINTED_LARGEST_ACCOUNTS_DEBUG = True
+    result = (response or {}).get("result") or {}
+    accounts = result.get("value") or []
     if not isinstance(accounts, list) or not accounts:
         return HolderStatus(status="unknown", error="rpc_no_largest_accounts", method="getTokenLargestAccounts", result_count=0)
     supply = fetch_token_supply(session, rpc_url, token_address, timeout)
@@ -564,21 +610,25 @@ def fetch_holder_status(
     if helius_url:
         try:
             return fetch_holder_status_rpc(session, helius_url, token_address, timeout)
-        except (requests.RequestException, ValueError) as exc:
+        except Exception as exc:
+            log(f"enrichment_error: {exc} for mint {token_address}")
             errors.append(f"helius_largest:{exc}")
         try:
             return fetch_holder_status_helius(session, helius_url, helius_url, token_address, timeout)
-        except (requests.RequestException, ValueError) as exc:
+        except Exception as exc:
+            log(f"enrichment_error: {exc} for mint {token_address}")
             errors.append(f"helius_accounts:{exc}")
         if rpc_url != helius_url:
             try:
                 return fetch_holder_status_rpc(session, rpc_url, token_address, timeout)
-            except (requests.RequestException, ValueError) as exc:
+            except Exception as exc:
+                log(f"enrichment_error: {exc} for mint {token_address}")
                 errors.append(f"rpc:{exc}")
         return HolderStatus(status="unknown", error=";".join(errors) if errors else "holder_unknown")
     try:
         return fetch_holder_status_rpc(session, rpc_url, token_address, timeout)
-    except (requests.RequestException, ValueError) as exc:
+    except Exception as exc:
+        log(f"enrichment_error: {exc} for mint {token_address}")
         errors.append(f"rpc:{exc}")
     return HolderStatus(status="unknown", error=";".join(errors) if errors else "holder_unknown")
 
@@ -662,7 +712,7 @@ def fetch_creator_from_mint_history(
 ) -> tuple[str | None, str | None, str | None]:
     if not is_valid_solana_pubkey(token_address):
         return None, None, f"invalid_mint:{safe_pubkey(token_address)}"
-    options = {"limit": 10, "commitment": "confirmed"}
+    options = {"limit": 1000, "commitment": "confirmed"}
     signatures = rpc_request(session, rpc_url, "getSignaturesForAddress", [token_address, options], timeout)
     if not isinstance(signatures, list) or not signatures:
         return None, None, "creator_mint_signatures_missing"
@@ -747,17 +797,20 @@ def fetch_creator_status(
         wallet, signature, error = fetch_creator_from_mint_history(session, creator_rpc_url, token_address, timeout)
         if error:
             errors.append(error)
-    except (requests.RequestException, ValueError) as exc:
+    except Exception as exc:
+        log(f"enrichment_error: {exc} for mint {token_address}")
         errors.append(f"creator_mint_history:{exc}")
     if not wallet:
         return CreatorStatus(quality="unknown", error=";".join([*errors, "creator_missing"]), signature=signature)
     try:
         balance = fetch_sol_balance(session, creator_rpc_url, wallet, timeout)
-    except (requests.RequestException, ValueError) as exc:
+    except Exception as exc:
+        log(f"enrichment_error: {exc} for mint {token_address}")
         return CreatorStatus(wallet=wallet, quality="error", error=f"creator_balance:{exc}", signature=signature)
     try:
         age_days = fetch_wallet_age_days(session, creator_rpc_url, wallet, timeout)
-    except (requests.RequestException, ValueError) as exc:
+    except Exception as exc:
+        log(f"enrichment_error: {exc} for mint {token_address}")
         return CreatorStatus(wallet=wallet, sol_balance=balance, quality="error", error=f"creator_age:{exc}", signature=signature)
     quality = creator_quality(balance, age_days)
     if quality == "unknown":
