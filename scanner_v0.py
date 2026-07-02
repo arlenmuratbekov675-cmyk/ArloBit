@@ -36,6 +36,11 @@ try:
 except Exception:  # research collection must never break scanning
     research = None
 
+try:
+    from arlobit import paper_store
+except Exception:  # paper trading must keep working even if the DB module can't load
+    paper_store = None
+
 
 BASE_URL = "https://api.dexscreener.com"
 SOLANA = "solana"
@@ -939,6 +944,22 @@ def fetch_current_price(session: requests.Session, token_address: str, timeout: 
     return price_usd
 
 
+def fetch_current_price_and_liquidity(
+    session: requests.Session, token_address: str, timeout: int
+) -> tuple[float | None, float | None]:
+    """Same lookup as fetch_current_price, also returning liquidity for
+    trade_ticks path logging. Never used for entry/exit decisions."""
+    pairs = fetch_token_pairs(session, token_address, timeout)
+    if not pairs:
+        return None, None
+    pairs.sort(key=lambda pair: number((pair.get("liquidity") or {}).get("usd")), reverse=True)
+    price_usd = number(pairs[0].get("priceUsd"), default=-1.0)
+    if price_usd <= 0:
+        return None, None
+    liquidity_usd = number((pairs[0].get("liquidity") or {}).get("usd"))
+    return price_usd, liquidity_usd
+
+
 def route_found_in_quote(payload: dict[str, Any]) -> bool:
     route_plan = payload.get("routePlan")
     if isinstance(route_plan, list) and route_plan:
@@ -1699,6 +1720,13 @@ def paper_close_message(trade: dict[str, Any]) -> str:
 
 
 def load_paper_trades() -> dict[str, Any]:
+    """Paper trades live in SQLite (data/arlobit.db) when it's available,
+    falling back to paper_trades.json so trading never depends on the DB."""
+    if paper_store is not None:
+        try:
+            return paper_store.load_state()
+        except Exception:
+            pass
     try:
         with open(PAPER_TRADES_FILE, "r", encoding="utf-8") as handle:
             state = json.load(handle)
@@ -1710,11 +1738,23 @@ def load_paper_trades() -> dict[str, Any]:
 
 
 def save_paper_trades(state: dict[str, Any]) -> None:
+    if paper_store is not None:
+        try:
+            paper_store.save_state(state)
+            return
+        except Exception:
+            pass
     with open(PAPER_TRADES_FILE, "w", encoding="utf-8") as handle:
         json.dump(state, handle, indent=2, sort_keys=True)
 
 
 def reset_paper_trades() -> str:
+    if paper_store is not None:
+        try:
+            return paper_store.reset_state()
+        except Exception:
+            pass
+
     timestamp_suffix = time.strftime("%Y%m%d_%H%M%S")
     backup_file = f"paper_trades_backup_{timestamp_suffix}.json"
     counter = 1
@@ -1872,7 +1912,7 @@ def update_open_paper_trades(
             continue
 
         mint = str(trade.get("mint") or "")
-        current_price = fetch_current_price(session, mint, timeout)
+        current_price, current_liquidity = fetch_current_price_and_liquidity(session, mint, timeout)
         if current_price is None:
             issues.append(f"paper:{mint}: price_unavailable")
             continue
@@ -1882,6 +1922,8 @@ def update_open_paper_trades(
         trade["current_price"] = current_price
         trade["current_pnl_percent"] = pnl
         trade["last_checked"] = now
+        if current_liquidity is not None:
+            trade["last_liquidity_usd"] = current_liquidity
         trade["max_gain"] = max(number(trade.get("max_gain")), pnl)
         trade["max_drawdown"] = min(number(trade.get("max_drawdown")), pnl)
 
@@ -2524,8 +2566,9 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument("--once", action="store_true", help="run one scan cycle and exit")
     mode.add_argument("--loop", action="store_true", help="run continuously until Ctrl+C")
     mode.add_argument("--stats", action="store_true", help="show paper trading stats and exit")
-    mode.add_argument("--export-trades-csv", action="store_true", help="export paper_trades.json to paper_trades.csv")
-    mode.add_argument("--reset-paper", action="store_true", help="back up paper_trades.json and reset paper trades")
+    mode.add_argument("--export-trades-csv", action="store_true", help="export paper trades to paper_trades.csv")
+    mode.add_argument("--export-json", action="store_true", help="export paper trades to paper_trades.json (backward compatibility only; SQLite is the live store)")
+    mode.add_argument("--reset-paper", action="store_true", help="back up paper trades and reset paper trading")
     mode.add_argument(
         "--test-paper-alert",
         action="store_true",
@@ -2823,10 +2866,17 @@ def main() -> int:
         exported = export_paper_trades_csv()
         print(f"Exported {exported} paper trades to {PAPER_TRADES_CSV_FILE}")
         return 0
+    if args.export_json:
+        if paper_store is None:
+            print(f"paper_store unavailable; {PAPER_TRADES_FILE} is already the live store", file=sys.stderr)
+            return 2
+        exported = paper_store.export_json(PAPER_TRADES_FILE)
+        print(f"Exported {exported} paper trades to {PAPER_TRADES_FILE}")
+        return 0
     if args.reset_paper:
         backup_file = reset_paper_trades()
         print(f"Backed up paper trades to {backup_file}")
-        print(f"Reset {PAPER_TRADES_FILE} to an empty paper trading file")
+        print("Reset paper trading state (SQLite store and paper_trades.json)")
         return 0
     if args.test_paper_alert:
         return run_test_paper_alert(args)

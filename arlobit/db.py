@@ -19,7 +19,7 @@ import os
 import sqlite3
 
 DEFAULT_DB_PATH = os.path.join("data", "arlobit.db")
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 OUTCOME_CHECKPOINTS_MIN = (5, 15, 30, 60, 120, 360, 720, 1440)
 
@@ -160,7 +160,17 @@ CREATE TABLE IF NOT EXISTS db_paper_trades (
     entry_time   REAL, entry_price REAL,
     exit_time    REAL, exit_price REAL, exit_reason TEXT,
     final_pnl_pct REAL, max_gain_pct REAL, max_drawdown_pct REAL,
-    status       TEXT
+    status       TEXT,
+    -- full trade dict (signals, holder/creator/score fields, ...); structured
+    -- columns above are authoritative for lifecycle facts, this backs
+    -- backward-compatible stats/CSV export without duplicating ~30 columns
+    payload_json TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_trades_identity ON db_paper_trades(mint, entry_time);
+
+CREATE TABLE IF NOT EXISTS paper_trade_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
 );
 
 CREATE TABLE IF NOT EXISTS trade_ticks (
@@ -204,11 +214,21 @@ def connect(path: str | None = None) -> sqlite3.Connection:
     return conn
 
 
+def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     if version >= SCHEMA_VERSION:
         return
     conn.executescript(SCHEMA)
+    if version < 2:
+        # v1 DBs already have db_paper_trades without payload_json; CREATE
+        # TABLE IF NOT EXISTS above is a no-op for them, so add it explicitly.
+        _add_column_if_missing(conn, "db_paper_trades", "payload_json", "TEXT")
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     conn.commit()
 
