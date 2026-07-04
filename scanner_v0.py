@@ -1375,7 +1375,6 @@ def print_debug_enrich(mint: str, holder: HolderStatus, creator: CreatorStatus) 
 
 def collect_rows(
     session: requests.Session,
-    limit: int,
     timeout: int,
     min_age_minutes: int,
     max_age_hours: int,
@@ -1459,7 +1458,7 @@ def collect_rows(
         )
     )
     enriched_rows: list[PairRow] = []
-    for row in rows[:limit]:
+    for row in rows:
         mint_status = mint_cache[row.token_address]
         sellability = sellability_cache.get(row.token_address)
         if sellability is None:
@@ -1521,7 +1520,7 @@ def collect_rows(
             -row.volume_5m,
         )
     )
-    return rows[:limit], issues, len(candidates), len(seen_pairs)
+    return rows, issues, len(candidates), len(seen_pairs)
 
 
 def money(value: float) -> str:
@@ -2701,7 +2700,6 @@ def run_scan_once(args: argparse.Namespace) -> ScanResult:
 
     rows, issues, candidate_count, pairs_scanned = collect_rows(
         session=session,
-        limit=args.limit,
         timeout=args.timeout,
         min_age_minutes=args.min_age_minutes,
         max_age_hours=args.max_age_hours,
@@ -2717,7 +2715,7 @@ def run_scan_once(args: argparse.Namespace) -> ScanResult:
         debug_enrich=args.debug_enrich,
     )
 
-    print(render_table(rows))
+    print(render_table(rows[: args.limit]))
     print(f"\nScanned {candidate_count} latest Solana profile/boost candidates.")
     alerts_sent, telegram_issues = send_telegram_alerts(
         session=session,
