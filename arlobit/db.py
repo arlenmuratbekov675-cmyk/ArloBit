@@ -19,7 +19,7 @@ import os
 import sqlite3
 
 DEFAULT_DB_PATH = os.path.join("data", "arlobit.db")
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 OUTCOME_CHECKPOINTS_MIN = (5, 15, 30, 60, 120, 360, 720, 1440)
 
@@ -255,6 +255,34 @@ CREATE TABLE IF NOT EXISTS wallet_cooccurrences (
 );
 CREATE INDEX IF NOT EXISTS idx_wallet_cooccurrences_count ON wallet_cooccurrences(times_seen_together);
 
+CREATE TABLE IF NOT EXISTS axiom_source_audits (
+    source_name       TEXT PRIMARY KEY,
+    checked_at        REAL NOT NULL,
+    status            TEXT NOT NULL,
+    official_docs_url TEXT,
+    api_available     INTEGER NOT NULL DEFAULT 0,
+    websocket_available INTEGER NOT NULL DEFAULT 0,
+    export_available  INTEGER NOT NULL DEFAULT 0,
+    notes             TEXT
+);
+
+CREATE TABLE IF NOT EXISTS axiom_signals (
+    signal_id          INTEGER PRIMARY KEY,
+    mint               TEXT REFERENCES tokens(mint),
+    wallet             TEXT,
+    signal_time        REAL,
+    signal_type        TEXT,
+    metric_name        TEXT,
+    metric_value       REAL,
+    raw_value          TEXT,
+    source             TEXT NOT NULL,
+    source_url         TEXT,
+    created_at         REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_axiom_signals_mint_time ON axiom_signals(mint, signal_time);
+CREATE INDEX IF NOT EXISTS idx_axiom_signals_wallet ON axiom_signals(wallet);
+CREATE INDEX IF NOT EXISTS idx_axiom_signals_type ON axiom_signals(signal_type);
+
 CREATE VIEW IF NOT EXISTS ml_dataset AS
 SELECT s.*,
        t.pair_created_at, t.first_source,
@@ -389,6 +417,38 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             CREATE INDEX IF NOT EXISTS idx_wallet_cooccurrences_count ON wallet_cooccurrences(times_seen_together);
             """
         )
+    if version < 5:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS axiom_source_audits (
+                source_name       TEXT PRIMARY KEY,
+                checked_at        REAL NOT NULL,
+                status            TEXT NOT NULL,
+                official_docs_url TEXT,
+                api_available     INTEGER NOT NULL DEFAULT 0,
+                websocket_available INTEGER NOT NULL DEFAULT 0,
+                export_available  INTEGER NOT NULL DEFAULT 0,
+                notes             TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS axiom_signals (
+                signal_id          INTEGER PRIMARY KEY,
+                mint               TEXT REFERENCES tokens(mint),
+                wallet             TEXT,
+                signal_time        REAL,
+                signal_type        TEXT,
+                metric_name        TEXT,
+                metric_value       REAL,
+                raw_value          TEXT,
+                source             TEXT NOT NULL,
+                source_url         TEXT,
+                created_at         REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_axiom_signals_mint_time ON axiom_signals(mint, signal_time);
+            CREATE INDEX IF NOT EXISTS idx_axiom_signals_wallet ON axiom_signals(wallet);
+            CREATE INDEX IF NOT EXISTS idx_axiom_signals_type ON axiom_signals(signal_type);
+            """
+        )
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     conn.commit()
 
@@ -407,6 +467,8 @@ def summary(conn: sqlite3.Connection) -> list[tuple[str, int]]:
         "wallet_stats",
         "wallet_token_outcomes",
         "wallet_cooccurrences",
+        "axiom_source_audits",
+        "axiom_signals",
     )
     return [(table, conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in tables]
 
