@@ -19,7 +19,7 @@ import os
 import sqlite3
 
 DEFAULT_DB_PATH = os.path.join("data", "arlobit.db")
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 OUTCOME_CHECKPOINTS_MIN = (5, 15, 30, 60, 120, 360, 720, 1440)
 
@@ -283,6 +283,60 @@ CREATE INDEX IF NOT EXISTS idx_axiom_signals_mint_time ON axiom_signals(mint, si
 CREATE INDEX IF NOT EXISTS idx_axiom_signals_wallet ON axiom_signals(wallet);
 CREATE INDEX IF NOT EXISTS idx_axiom_signals_type ON axiom_signals(signal_type);
 
+CREATE TABLE IF NOT EXISTS token_velocity (
+    mint                    TEXT PRIMARY KEY REFERENCES tokens(mint),
+    sighting_id             INTEGER REFERENCES candidate_sightings(sighting_id),
+    seen_at                 REAL,
+    computed_at             REAL NOT NULL,
+    liquidity_change_5m     REAL,
+    liquidity_change_15m    REAL,
+    liquidity_change_1h     REAL,
+    volume_change_5m        REAL,
+    volume_change_15m       REAL,
+    volume_change_1h        REAL,
+    buy_count_change        REAL,
+    sell_count_change       REAL,
+    buy_sell_ratio_change   REAL,
+    price_change_velocity   REAL,
+    volume_acceleration     REAL,
+    liquidity_acceleration  REAL,
+    reached_50              INTEGER,
+    reached_100             INTEGER,
+    reached_500             INTEGER,
+    rugged                  INTEGER,
+    ret_24h                 REAL,
+    max_runup_pct           REAL,
+    max_drawdown_pct        REAL,
+    label_version           INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_token_velocity_seen_at ON token_velocity(seen_at);
+CREATE INDEX IF NOT EXISTS idx_token_velocity_reached_100 ON token_velocity(reached_100);
+CREATE INDEX IF NOT EXISTS idx_token_velocity_rugged ON token_velocity(rugged);
+
+CREATE TABLE IF NOT EXISTS velocity_signals (
+    feature_name             TEXT NOT NULL,
+    bucket_label             TEXT NOT NULL,
+    bucket_min               REAL,
+    bucket_max               REAL,
+    n                        INTEGER NOT NULL,
+    reached_50_rate          REAL,
+    reached_100_rate         REAL,
+    reached_500_rate         REAL,
+    rug_rate                 REAL,
+    avg_ret_24h              REAL,
+    avg_max_runup_pct        REAL,
+    avg_max_drawdown_pct     REAL,
+    pump_lift                REAL,
+    rug_lift                 REAL,
+    pump_p_value             REAL,
+    rug_p_value              REAL,
+    computed_at              REAL NOT NULL,
+    PRIMARY KEY (feature_name, bucket_label)
+);
+CREATE INDEX IF NOT EXISTS idx_velocity_signals_feature ON velocity_signals(feature_name);
+CREATE INDEX IF NOT EXISTS idx_velocity_signals_pump ON velocity_signals(reached_100_rate);
+CREATE INDEX IF NOT EXISTS idx_velocity_signals_rug ON velocity_signals(rug_rate);
+
 CREATE VIEW IF NOT EXISTS ml_dataset AS
 SELECT s.*,
        t.pair_created_at, t.first_source,
@@ -449,6 +503,64 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             CREATE INDEX IF NOT EXISTS idx_axiom_signals_type ON axiom_signals(signal_type);
             """
         )
+    if version < 6:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS token_velocity (
+                mint                    TEXT PRIMARY KEY REFERENCES tokens(mint),
+                sighting_id             INTEGER REFERENCES candidate_sightings(sighting_id),
+                seen_at                 REAL,
+                computed_at             REAL NOT NULL,
+                liquidity_change_5m     REAL,
+                liquidity_change_15m    REAL,
+                liquidity_change_1h     REAL,
+                volume_change_5m        REAL,
+                volume_change_15m       REAL,
+                volume_change_1h        REAL,
+                buy_count_change        REAL,
+                sell_count_change       REAL,
+                buy_sell_ratio_change   REAL,
+                price_change_velocity   REAL,
+                volume_acceleration     REAL,
+                liquidity_acceleration  REAL,
+                reached_50              INTEGER,
+                reached_100             INTEGER,
+                reached_500             INTEGER,
+                rugged                  INTEGER,
+                ret_24h                 REAL,
+                max_runup_pct           REAL,
+                max_drawdown_pct        REAL,
+                label_version           INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_token_velocity_seen_at ON token_velocity(seen_at);
+            CREATE INDEX IF NOT EXISTS idx_token_velocity_reached_100 ON token_velocity(reached_100);
+            CREATE INDEX IF NOT EXISTS idx_token_velocity_rugged ON token_velocity(rugged);
+
+            CREATE TABLE IF NOT EXISTS velocity_signals (
+                feature_name             TEXT NOT NULL,
+                bucket_label             TEXT NOT NULL,
+                bucket_min               REAL,
+                bucket_max               REAL,
+                n                        INTEGER NOT NULL,
+                reached_50_rate          REAL,
+                reached_100_rate         REAL,
+                reached_500_rate         REAL,
+                rug_rate                 REAL,
+                avg_ret_24h              REAL,
+                avg_max_runup_pct        REAL,
+                avg_max_drawdown_pct     REAL,
+                pump_lift                REAL,
+                rug_lift                 REAL,
+                pump_p_value             REAL,
+                rug_p_value              REAL,
+                computed_at              REAL NOT NULL,
+                PRIMARY KEY (feature_name, bucket_label)
+            );
+            CREATE INDEX IF NOT EXISTS idx_velocity_signals_feature ON velocity_signals(feature_name);
+            CREATE INDEX IF NOT EXISTS idx_velocity_signals_pump ON velocity_signals(reached_100_rate);
+            CREATE INDEX IF NOT EXISTS idx_velocity_signals_rug ON velocity_signals(rug_rate);
+            """
+        )
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     conn.commit()
 
@@ -469,6 +581,8 @@ def summary(conn: sqlite3.Connection) -> list[tuple[str, int]]:
         "wallet_cooccurrences",
         "axiom_source_audits",
         "axiom_signals",
+        "token_velocity",
+        "velocity_signals",
     )
     return [(table, conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in tables]
 
