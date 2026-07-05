@@ -19,7 +19,7 @@ import os
 import sqlite3
 
 DEFAULT_DB_PATH = os.path.join("data", "arlobit.db")
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 OUTCOME_CHECKPOINTS_MIN = (5, 15, 30, 60, 120, 360, 720, 1440)
 
@@ -212,6 +212,19 @@ CREATE TABLE IF NOT EXISTS wallet_stats (
     avg_ret_24h           REAL,
     avg_max_runup_pct     REAL,
     avg_max_drawdown_pct  REAL,
+    total_tokens_seen     INTEGER NOT NULL DEFAULT 0,
+    total_completed       INTEGER NOT NULL DEFAULT 0,
+    total_pumps           INTEGER NOT NULL DEFAULT 0,
+    total_50pct           INTEGER NOT NULL DEFAULT 0,
+    total_rugs            INTEGER NOT NULL DEFAULT 0,
+    average_return_24h    REAL,
+    average_max_runup     REAL,
+    average_drawdown      REAL,
+    win_rate              REAL,
+    profit_factor         REAL,
+    expectancy            REAL,
+    confidence_score      REAL,
+    reputation            TEXT,
     updated_at            REAL NOT NULL
 );
 
@@ -232,6 +245,15 @@ CREATE TABLE IF NOT EXISTS wallet_token_outcomes (
 );
 CREATE INDEX IF NOT EXISTS idx_wallet_token_outcomes_mint ON wallet_token_outcomes(mint);
 CREATE INDEX IF NOT EXISTS idx_wallet_token_outcomes_wallet ON wallet_token_outcomes(buyer_wallet);
+
+CREATE TABLE IF NOT EXISTS wallet_cooccurrences (
+    wallet_a             TEXT NOT NULL,
+    wallet_b             TEXT NOT NULL,
+    times_seen_together  INTEGER NOT NULL,
+    updated_at           REAL NOT NULL,
+    PRIMARY KEY (wallet_a, wallet_b)
+);
+CREATE INDEX IF NOT EXISTS idx_wallet_cooccurrences_count ON wallet_cooccurrences(times_seen_together);
 
 CREATE VIEW IF NOT EXISTS ml_dataset AS
 SELECT s.*,
@@ -337,6 +359,36 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             CREATE INDEX IF NOT EXISTS idx_wallet_token_outcomes_wallet ON wallet_token_outcomes(buyer_wallet);
             """
         )
+    if version < 4:
+        _add_column_if_missing(conn, "wallet_stats", "total_tokens_seen", "INTEGER NOT NULL DEFAULT 0")
+        _add_column_if_missing(conn, "wallet_stats", "total_completed", "INTEGER NOT NULL DEFAULT 0")
+        _add_column_if_missing(conn, "wallet_stats", "total_pumps", "INTEGER NOT NULL DEFAULT 0")
+        _add_column_if_missing(conn, "wallet_stats", "total_50pct", "INTEGER NOT NULL DEFAULT 0")
+        _add_column_if_missing(conn, "wallet_stats", "total_rugs", "INTEGER NOT NULL DEFAULT 0")
+        _add_column_if_missing(conn, "wallet_stats", "average_return_24h", "REAL")
+        _add_column_if_missing(conn, "wallet_stats", "average_max_runup", "REAL")
+        _add_column_if_missing(conn, "wallet_stats", "average_drawdown", "REAL")
+        _add_column_if_missing(conn, "wallet_stats", "win_rate", "REAL")
+        _add_column_if_missing(conn, "wallet_stats", "profit_factor", "REAL")
+        _add_column_if_missing(conn, "wallet_stats", "expectancy", "REAL")
+        _add_column_if_missing(conn, "wallet_stats", "confidence_score", "REAL")
+        _add_column_if_missing(conn, "wallet_stats", "reputation", "TEXT")
+        conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_wallet_stats_reputation ON wallet_stats(reputation);
+            CREATE INDEX IF NOT EXISTS idx_wallet_stats_expectancy ON wallet_stats(expectancy);
+            CREATE INDEX IF NOT EXISTS idx_wallet_stats_completed ON wallet_stats(total_completed);
+
+            CREATE TABLE IF NOT EXISTS wallet_cooccurrences (
+                wallet_a             TEXT NOT NULL,
+                wallet_b             TEXT NOT NULL,
+                times_seen_together  INTEGER NOT NULL,
+                updated_at           REAL NOT NULL,
+                PRIMARY KEY (wallet_a, wallet_b)
+            );
+            CREATE INDEX IF NOT EXISTS idx_wallet_cooccurrences_count ON wallet_cooccurrences(times_seen_together);
+            """
+        )
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     conn.commit()
 
@@ -354,6 +406,7 @@ def summary(conn: sqlite3.Connection) -> list[tuple[str, int]]:
         "early_buyers",
         "wallet_stats",
         "wallet_token_outcomes",
+        "wallet_cooccurrences",
     )
     return [(table, conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in tables]
 

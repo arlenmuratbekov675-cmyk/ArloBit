@@ -456,52 +456,9 @@ def mark_repeat_buyers(conn: Any) -> None:
 
 
 def refresh_wallet_outcomes(conn: Any) -> None:
-    now = time.time()
-    conn.execute("DELETE FROM wallet_token_outcomes")
-    conn.execute(
-        """
-        INSERT INTO wallet_token_outcomes (
-            buyer_wallet, mint, first_buy_time, reached_50, reached_100, reached_500,
-            rugged, ret_24h, max_runup_pct, max_drawdown_pct, label_version, updated_at
-        )
-        SELECT eb.buyer_wallet, eb.mint, eb.first_buy_time,
-               l.reached_50, l.reached_100, l.reached_500, l.rugged,
-               l.ret_24h, l.max_runup_pct, l.max_drawdown_pct, l.label_version, ?
-        FROM early_buyers eb
-        LEFT JOIN labels l ON l.mint = eb.mint AND l.label_version = 1
-        """,
-        (now,),
-    )
-    conn.execute("DELETE FROM wallet_stats")
-    conn.execute(
-        """
-        INSERT INTO wallet_stats (
-            buyer_wallet, first_seen_at, last_seen_at, early_buy_count, distinct_mints,
-            successful_50_count, successful_100_count, successful_500_count, rugged_count,
-            avg_ret_24h, avg_max_runup_pct, avg_max_drawdown_pct, updated_at
-        )
-        SELECT eb.buyer_wallet,
-               MIN(eb.first_buy_time),
-               MAX(eb.first_buy_time),
-               COUNT(*),
-               COUNT(DISTINCT eb.mint),
-               SUM(CASE WHEN wto.reached_50 = 1 THEN 1 ELSE 0 END),
-               SUM(CASE WHEN wto.reached_100 = 1 THEN 1 ELSE 0 END),
-               SUM(CASE WHEN wto.reached_500 = 1 THEN 1 ELSE 0 END),
-               SUM(CASE WHEN wto.rugged = 1 THEN 1 ELSE 0 END),
-               AVG(wto.ret_24h),
-               AVG(wto.max_runup_pct),
-               AVG(wto.max_drawdown_pct),
-               ?
-        FROM early_buyers eb
-        LEFT JOIN wallet_token_outcomes wto
-          ON wto.buyer_wallet = eb.buyer_wallet AND wto.mint = eb.mint
-        GROUP BY eb.buyer_wallet
-        """,
-        (now,),
-    )
-    mark_repeat_buyers(conn)
-    conn.commit()
+    from arlobit import wallets
+
+    wallets.refresh_wallet_intelligence(conn)
 
 
 def summary_lines(conn: Any, top_limit: int = 15) -> list[str]:
