@@ -19,7 +19,7 @@ import os
 import sqlite3
 
 DEFAULT_DB_PATH = os.path.join("data", "arlobit.db")
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 OUTCOME_CHECKPOINTS_MIN = (5, 15, 30, 60, 120, 360, 720, 1440)
 
@@ -181,6 +181,58 @@ CREATE TABLE IF NOT EXISTS trade_ticks (
     PRIMARY KEY (trade_id, ts)
 );
 
+CREATE TABLE IF NOT EXISTS early_buyers (
+    mint             TEXT NOT NULL REFERENCES tokens(mint),
+    buyer_wallet     TEXT NOT NULL,
+    first_buy_time   REAL,
+    buy_amount_sol   REAL,
+    buy_amount_usd   REAL,
+    token_amount     REAL,
+    tx_signature     TEXT,
+    slot             INTEGER,
+    source           TEXT,
+    is_dev_wallet    INTEGER,
+    is_repeat_buyer  INTEGER,
+    created_at       REAL NOT NULL,
+    PRIMARY KEY (mint, buyer_wallet)
+);
+CREATE INDEX IF NOT EXISTS idx_early_buyers_wallet ON early_buyers(buyer_wallet);
+CREATE INDEX IF NOT EXISTS idx_early_buyers_mint_time ON early_buyers(mint, first_buy_time);
+
+CREATE TABLE IF NOT EXISTS wallet_stats (
+    buyer_wallet          TEXT PRIMARY KEY,
+    first_seen_at         REAL,
+    last_seen_at          REAL,
+    early_buy_count       INTEGER NOT NULL DEFAULT 0,
+    distinct_mints        INTEGER NOT NULL DEFAULT 0,
+    successful_50_count   INTEGER NOT NULL DEFAULT 0,
+    successful_100_count  INTEGER NOT NULL DEFAULT 0,
+    successful_500_count  INTEGER NOT NULL DEFAULT 0,
+    rugged_count          INTEGER NOT NULL DEFAULT 0,
+    avg_ret_24h           REAL,
+    avg_max_runup_pct     REAL,
+    avg_max_drawdown_pct  REAL,
+    updated_at            REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS wallet_token_outcomes (
+    buyer_wallet         TEXT NOT NULL,
+    mint                 TEXT NOT NULL REFERENCES tokens(mint),
+    first_buy_time       REAL,
+    reached_50           INTEGER,
+    reached_100          INTEGER,
+    reached_500          INTEGER,
+    rugged               INTEGER,
+    ret_24h              REAL,
+    max_runup_pct        REAL,
+    max_drawdown_pct     REAL,
+    label_version        INTEGER,
+    updated_at           REAL NOT NULL,
+    PRIMARY KEY (buyer_wallet, mint)
+);
+CREATE INDEX IF NOT EXISTS idx_wallet_token_outcomes_mint ON wallet_token_outcomes(mint);
+CREATE INDEX IF NOT EXISTS idx_wallet_token_outcomes_wallet ON wallet_token_outcomes(buyer_wallet);
+
 CREATE VIEW IF NOT EXISTS ml_dataset AS
 SELECT s.*,
        t.pair_created_at, t.first_source,
@@ -229,6 +281,62 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         # v1 DBs already have db_paper_trades without payload_json; CREATE
         # TABLE IF NOT EXISTS above is a no-op for them, so add it explicitly.
         _add_column_if_missing(conn, "db_paper_trades", "payload_json", "TEXT")
+    if version < 3:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS early_buyers (
+                mint             TEXT NOT NULL REFERENCES tokens(mint),
+                buyer_wallet     TEXT NOT NULL,
+                first_buy_time   REAL,
+                buy_amount_sol   REAL,
+                buy_amount_usd   REAL,
+                token_amount     REAL,
+                tx_signature     TEXT,
+                slot             INTEGER,
+                source           TEXT,
+                is_dev_wallet    INTEGER,
+                is_repeat_buyer  INTEGER,
+                created_at       REAL NOT NULL,
+                PRIMARY KEY (mint, buyer_wallet)
+            );
+            CREATE INDEX IF NOT EXISTS idx_early_buyers_wallet ON early_buyers(buyer_wallet);
+            CREATE INDEX IF NOT EXISTS idx_early_buyers_mint_time ON early_buyers(mint, first_buy_time);
+
+            CREATE TABLE IF NOT EXISTS wallet_stats (
+                buyer_wallet          TEXT PRIMARY KEY,
+                first_seen_at         REAL,
+                last_seen_at          REAL,
+                early_buy_count       INTEGER NOT NULL DEFAULT 0,
+                distinct_mints        INTEGER NOT NULL DEFAULT 0,
+                successful_50_count   INTEGER NOT NULL DEFAULT 0,
+                successful_100_count  INTEGER NOT NULL DEFAULT 0,
+                successful_500_count  INTEGER NOT NULL DEFAULT 0,
+                rugged_count          INTEGER NOT NULL DEFAULT 0,
+                avg_ret_24h           REAL,
+                avg_max_runup_pct     REAL,
+                avg_max_drawdown_pct  REAL,
+                updated_at            REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS wallet_token_outcomes (
+                buyer_wallet         TEXT NOT NULL,
+                mint                 TEXT NOT NULL REFERENCES tokens(mint),
+                first_buy_time       REAL,
+                reached_50           INTEGER,
+                reached_100          INTEGER,
+                reached_500          INTEGER,
+                rugged               INTEGER,
+                ret_24h              REAL,
+                max_runup_pct        REAL,
+                max_drawdown_pct     REAL,
+                label_version        INTEGER,
+                updated_at           REAL NOT NULL,
+                PRIMARY KEY (buyer_wallet, mint)
+            );
+            CREATE INDEX IF NOT EXISTS idx_wallet_token_outcomes_mint ON wallet_token_outcomes(mint);
+            CREATE INDEX IF NOT EXISTS idx_wallet_token_outcomes_wallet ON wallet_token_outcomes(buyer_wallet);
+            """
+        )
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     conn.commit()
 
@@ -243,6 +351,9 @@ def summary(conn: sqlite3.Connection) -> list[tuple[str, int]]:
         "ohlcv_1m",
         "db_paper_trades",
         "trade_ticks",
+        "early_buyers",
+        "wallet_stats",
+        "wallet_token_outcomes",
     )
     return [(table, conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in tables]
 

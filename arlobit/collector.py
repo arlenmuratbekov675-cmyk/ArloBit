@@ -30,6 +30,11 @@ from typing import Any, Callable
 
 from arlobit import db
 
+try:
+    from arlobit import early_buyers
+except Exception:
+    early_buyers = None
+
 SAMPLE_MAX_DEFAULT = 15
 SAMPLE_DEADLINE_SECONDS_DEFAULT = 150.0
 SAMPLE_DELAY_SECONDS = 0.5
@@ -410,6 +415,13 @@ class CycleRecorder:
             f" ({len(self.enriched_mints)} enriched, {len(self.sampled_mints)} sampled rejected),"
             f" {len(new_mints)} new tokens"
         )
+        if early_buyers is not None and new_mints:
+            try:
+                processed, buyers = early_buyers.collect_for_new_mints(new_mints)
+                if processed:
+                    print(f"[research] early buyers: {buyers} buyers stored for {processed} new mints")
+            except Exception as exc:
+                _warn(f"early buyer collection skipped: {exc!r}")
 
 
 # -- module-level safe API (what scanner_v0.py calls) ---------------------------
