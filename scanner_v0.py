@@ -76,6 +76,11 @@ LOW_LIQUIDITY_USD = 5_000
 MIN_SAFE_VOLUME_LIQUIDITY_RATIO = 0.10
 MAX_SAFE_VOLUME_LIQUIDITY_RATIO = 0.50
 ANOMALY_VOLUME_LIQUIDITY_RATIO = 2.0
+# Paper-entry calibration (2026-07-05, from report_false_negatives.py): paper
+# trading uses wider thresholds than the SAFE verdict / telegram alerts, which
+# keep the SAFE_* values above.
+PAPER_MIN_LIQUIDITY_USD = 15_000
+PAPER_MAX_VOLUME_LIQUIDITY_RATIO = 2.0
 BLOCKED_PAPER_REASONS = (
     "too_young",
     "liquidity_too_low",
@@ -84,6 +89,7 @@ BLOCKED_PAPER_REASONS = (
     "honeypot_no_route",
     "sell_impact_too_high",
     "sellability_unknown",
+    "mint_or_freeze_authority",
     "blocked_holder_unknown",
     "blocked_creator_unknown",
     "blocked_score_unavailable",
@@ -1611,42 +1617,41 @@ def empty_blocked_paper_reason_counts() -> dict[str, int]:
 
 
 def paper_entry_blocked_reasons(row: PairRow) -> list[str]:
+    """Hard blocks for paper entry (calibrated 2026-07-05 from the false
+    negative report). Non-scam holder/creator signals and arlobit_score are
+    informational only — they stay in the research columns but no longer
+    block. Telegram alerts keep the stricter should_alert() gate."""
     reasons: list[str] = []
     if row.age_minutes is None or row.age_minutes < SAFE_MIN_AGE_MINUTES:
         reasons.append("too_young")
-    if row.liquidity < SAFE_MIN_LIQUIDITY_USD:
+    if row.liquidity < PAPER_MIN_LIQUIDITY_USD:
         reasons.append("liquidity_too_low")
 
     volume_liquidity_ratio = row.volume_5m / row.liquidity if row.liquidity > 0 else float("inf")
-    if volume_liquidity_ratio > MAX_SAFE_VOLUME_LIQUIDITY_RATIO:
+    if volume_liquidity_ratio > PAPER_MAX_VOLUME_LIQUIDITY_RATIO:
         reasons.append("vol_liq_too_high")
     elif volume_liquidity_ratio < MIN_SAFE_VOLUME_LIQUIDITY_RATIO:
         reasons.append("vol_liq_too_low")
     if row.sellable == "no" and not row.sell_route_found:
         reasons.append("honeypot_no_route")
-    elif row.sellable != "yes" and row.sell_check_error:
+    elif row.sellable != "yes":
         reasons.append("sellability_unknown")
-    elif row.sell_price_impact_pct is not None and row.sell_price_impact_pct > 15:
+    elif row.sell_price_impact_pct is None:
+        reasons.append("sellability_unknown")
+    elif row.sell_price_impact_pct > 15:
         reasons.append("sell_impact_too_high")
-    if row.holder_data_status != "ok":
-        reasons.append("blocked_holder_unknown")
-        reasons.append("blocked_score_unavailable")
-    elif row.top_1_holder_pct is not None and row.top_1_holder_pct > 20:
-        reasons.append("scam_holder")
-    elif row.top_10_holders_pct is not None and row.top_10_holders_pct > 40:
-        reasons.append("scam_holder" if row.top_10_holders_pct > 60 else "risky_holder")
-    if row.creator_quality in {"unknown", "error"}:
-        reasons.append("blocked_creator_unknown")
-        reasons.append("blocked_score_unavailable")
-    elif row.creator_quality == "risky":
-        reasons.append("creator_risky")
-        if (
-            (row.creator_wallet_age_days is not None and row.creator_wallet_age_days < 1)
-            or (row.creator_sol_balance is not None and row.creator_sol_balance < 0.1)
-        ):
-            reasons.append("scam_creator")
-    if row.arlobit_score < 6:
-        reasons.append("score_too_low")
+    if row.mint_authority_active is not False or row.freeze_authority_active is not False:
+        reasons.append("mint_or_freeze_authority")
+    if row.holder_data_status == "ok":
+        if row.top_1_holder_pct is not None and row.top_1_holder_pct > 20:
+            reasons.append("scam_holder")
+        elif row.top_10_holders_pct is not None and row.top_10_holders_pct > 60:
+            reasons.append("scam_holder")
+    if row.creator_quality == "risky" and (
+        (row.creator_wallet_age_days is not None and row.creator_wallet_age_days < 1)
+        or (row.creator_sol_balance is not None and row.creator_sol_balance < 0.1)
+    ):
+        reasons.append("scam_creator")
     return list(dict.fromkeys(reasons))
 
 
@@ -1977,7 +1982,11 @@ def open_paper_trades(
     recent_entries = recent_paper_entry_count(state, now)
 
     for row in rows:
-        if not should_alert(row, min_age_minutes, max_age_hours):
+        # Paper entry is gated by paper_entry_blocked_reasons alone (plus the
+        # age window); should_alert() remains the telegram-alert gate only.
+        if row.age_minutes is None or not (
+            min_age_minutes < row.age_minutes < max_age_hours * 60
+        ):
             continue
         blocked_reasons = paper_entry_blocked_reasons(row)
         if blocked_reasons:
