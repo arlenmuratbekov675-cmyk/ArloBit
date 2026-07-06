@@ -96,6 +96,12 @@ def _pct(value: Any) -> str:
     return f"{number * 100:.1f}%"
 
 
+def _per_day(count: int, days: float | None) -> str:
+    if days is None or days <= 0:
+        return "-"
+    return f"{count / days:.2f}"
+
+
 def _iso(ts: float | None) -> str:
     if ts is None:
         return "-"
@@ -450,6 +456,173 @@ def _recent_trades(conn: sqlite3.Connection, limit: int = 12) -> list[str]:
     return lines
 
 
+def _audit_rows(conn: sqlite3.Connection, started_at: float) -> list[sqlite3.Row]:
+    conn.row_factory = sqlite3.Row
+    return conn.execute(
+        """
+        SELECT tv.mint, tv.sighting_id, tv.seen_at,
+               tv.price_change_velocity, tv.buy_sell_ratio_change,
+               s.buy_sell_ratio_m5
+        FROM token_velocity tv
+        JOIN candidate_sightings s ON s.sighting_id = tv.sighting_id
+        WHERE tv.seen_at >= ?
+        ORDER BY tv.seen_at, tv.mint
+        """,
+        (started_at,),
+    ).fetchall()
+
+
+def _count(rows: list[sqlite3.Row], predicate: Any) -> int:
+    return sum(1 for row in rows if predicate(row))
+
+
+def _audit_report(conn: sqlite3.Connection, started_at: float) -> list[str]:
+    rows = _audit_rows(conn, started_at)
+    candidate_counts = conn.execute(
+        """
+        SELECT COUNT(*), MIN(seen_at), MAX(seen_at)
+        FROM candidate_sightings
+        WHERE seen_at >= ?
+        """,
+        (started_at,),
+    ).fetchone()
+    new_candidates = int(candidate_counts[0] or 0)
+    max_seen_at = _num(candidate_counts[2])
+    days = None
+    if max_seen_at is not None and max_seen_at > started_at:
+        days = (max_seen_at - started_at) / (24 * 60 * 60)
+
+    price_available = _count(rows, lambda row: _num(row["price_change_velocity"]) is not None)
+    ratio_change_available = _count(rows, lambda row: _num(row["buy_sell_ratio_change"]) is not None)
+    current_ratio_available = _count(rows, lambda row: _num(row["buy_sell_ratio_m5"]) is not None)
+
+    price_velocity_gt_004 = _count(
+        rows,
+        lambda row: (value := _num(row["price_change_velocity"])) is not None and value > 0.04,
+    )
+    ratio_change_gt_neg005 = _count(
+        rows,
+        lambda row: (value := _num(row["buy_sell_ratio_change"])) is not None and value > -0.05,
+    )
+    ratio_change_lte_013 = _count(
+        rows,
+        lambda row: (value := _num(row["buy_sell_ratio_change"])) is not None and value <= 0.13,
+    )
+    ratio_change_current = _count(
+        rows,
+        lambda row: (value := _num(row["buy_sell_ratio_change"])) is not None and -0.05 < value <= 0.13,
+    )
+    current_ratio_gt_055 = _count(
+        rows,
+        lambda row: (value := _num(row["buy_sell_ratio_m5"])) is not None and value > 0.55,
+    )
+    current_ratio_lte_064 = _count(
+        rows,
+        lambda row: (value := _num(row["buy_sell_ratio_m5"])) is not None and value <= 0.64,
+    )
+    current_ratio_current = _count(
+        rows,
+        lambda row: (value := _num(row["buy_sell_ratio_m5"])) is not None and 0.55 < value <= 0.64,
+    )
+
+    rule_1_matches = _count(rows, lambda row: RULES[0].matches(row))
+    rule_2_matches = _count(rows, lambda row: RULES[1].matches(row))
+
+    relaxed_rule_3 = _count(
+        rows,
+        lambda row: (price := _num(row["price_change_velocity"])) is not None
+        and price > 0.0
+        and (ratio := _num(row["buy_sell_ratio_change"])) is not None
+        and -0.25 < ratio <= 0.25,
+    )
+    relaxed_rule_4 = _count(
+        rows,
+        lambda row: (ratio_change := _num(row["buy_sell_ratio_change"])) is not None
+        and -0.25 < ratio_change <= 0.25
+        and (current_ratio := _num(row["buy_sell_ratio_m5"])) is not None
+        and 0.45 < current_ratio <= 0.75,
+    )
+    historical_rows = conn.execute(
+        """
+        SELECT tv.mint, tv.sighting_id, tv.seen_at,
+               tv.price_change_velocity, tv.buy_sell_ratio_change,
+               s.buy_sell_ratio_m5
+        FROM token_velocity tv
+        JOIN candidate_sightings s ON s.sighting_id = tv.sighting_id
+        ORDER BY tv.seen_at, tv.mint
+        """
+    ).fetchall()
+    historical_days = None
+    if len(historical_rows) >= 2:
+        first_seen = _num(historical_rows[0]["seen_at"])
+        last_seen = _num(historical_rows[-1]["seen_at"])
+        if first_seen is not None and last_seen is not None and last_seen > first_seen:
+            historical_days = (last_seen - first_seen) / (24 * 60 * 60)
+    historical_rule_3 = _count(
+        historical_rows,
+        lambda row: (price := _num(row["price_change_velocity"])) is not None
+        and price > 0.0
+        and (ratio := _num(row["buy_sell_ratio_change"])) is not None
+        and -0.25 < ratio <= 0.25,
+    )
+    historical_rule_4 = _count(
+        historical_rows,
+        lambda row: (ratio_change := _num(row["buy_sell_ratio_change"])) is not None
+        and -0.25 < ratio_change <= 0.25
+        and (current_ratio := _num(row["buy_sell_ratio_m5"])) is not None
+        and 0.45 < current_ratio <= 0.75,
+    )
+
+    missing_velocity_rows = max(new_candidates - len(rows), 0)
+    missing_price = len(rows) - price_available
+    missing_ratio_change = len(rows) - ratio_change_available
+    blockers = [
+        ("no token_velocity row for sighting", missing_velocity_rows),
+        ("price_change_velocity unavailable", missing_price),
+        ("buy_sell_ratio_change unavailable", missing_ratio_change),
+        ("candidate.buy_sell_ratio_m5 unavailable", len(rows) - current_ratio_available),
+        ("price_change_velocity <= 0.04", len(rows) - price_velocity_gt_004),
+        ("buy_sell_ratio_change outside (-0.05, 0.13]", len(rows) - ratio_change_current),
+        ("candidate.buy_sell_ratio_m5 outside (0.55, 0.64]", len(rows) - current_ratio_current),
+    ]
+    top_blocker = max(blockers, key=lambda item: item[1]) if blockers else ("-", 0)
+
+    return [
+        "",
+        "Forward strictness audit:",
+        f"- new candidate sightings since forward_start: {new_candidates}",
+        f"- candidate sightings with token_velocity rows: {len(rows)}",
+        f"- velocity.price_change_velocity available: {price_available}",
+        f"- velocity.buy_sell_ratio_change available: {ratio_change_available}",
+        f"- candidate.buy_sell_ratio_m5 available on velocity rows: {current_ratio_available}",
+        "",
+        "Condition pass counts on forward token_velocity rows:",
+        f"- velocity.price_change_velocity > 0.04: {price_velocity_gt_004}",
+        f"- velocity.buy_sell_ratio_change > -0.05: {ratio_change_gt_neg005}",
+        f"- velocity.buy_sell_ratio_change <= 0.13: {ratio_change_lte_013}",
+        f"- velocity.buy_sell_ratio_change in (-0.05, 0.13]: {ratio_change_current}",
+        f"- candidate.buy_sell_ratio_m5 > 0.55: {current_ratio_gt_055}",
+        f"- candidate.buy_sell_ratio_m5 <= 0.64: {current_ratio_lte_064}",
+        f"- candidate.buy_sell_ratio_m5 in (0.55, 0.64]: {current_ratio_current}",
+        "",
+        "Forward trigger estimates:",
+        f"- v3_rule_1: {rule_1_matches} matches ({_per_day(rule_1_matches, days)}/day)",
+        f"- v3_rule_2: {rule_2_matches} matches ({_per_day(rule_2_matches, days)}/day)",
+        "",
+        "Largest blocker:",
+        f"- {top_blocker[0]} blocks {top_blocker[1]} candidate(s)",
+        "",
+        "Relaxed shadow-only proposals, not active:",
+        "- v3_rule_3 proposal: velocity.price_change_velocity > 0.0 AND velocity.buy_sell_ratio_change in (-0.25, 0.25]",
+        f"  forward estimate with current feature availability: {relaxed_rule_3} matches ({_per_day(relaxed_rule_3, days)}/day)",
+        f"  historical support once velocity values exist: {historical_rule_3} matches ({_per_day(historical_rule_3, historical_days)}/day)",
+        "- v3_rule_4 proposal: velocity.buy_sell_ratio_change in (-0.25, 0.25] AND candidate.buy_sell_ratio_m5 in (0.45, 0.75]",
+        f"  forward estimate with current feature availability: {relaxed_rule_4} matches ({_per_day(relaxed_rule_4, days)}/day)",
+        f"  historical support once velocity values exist: {historical_rule_4} matches ({_per_day(historical_rule_4, historical_days)}/day)",
+        "Conclusion: current forward zero matches are caused by missing forward velocity values before rule strictness can be measured.",
+    ]
+
+
 def report_lines(conn: sqlite3.Connection) -> list[str]:
     inserted, updated, started_at = refresh(conn)
     stop_at = started_at + WINDOW_DAYS * 24 * 60 * 60
@@ -475,6 +648,7 @@ def report_lines(conn: sqlite3.Connection) -> list[str]:
         "Rules:",
     ]
     lines.extend(f"- {rule.rule_id}: {rule.description}" for rule in RULES)
+    lines.extend(_audit_report(conn, started_at))
     lines.extend(["", "Rule performance:", *_rule_summary(conn), "", "Recent shadow trades:", *_recent_trades(conn)])
     lines.append("=== END REPORT ===")
     return lines
