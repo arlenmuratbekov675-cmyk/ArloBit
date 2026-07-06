@@ -140,7 +140,7 @@ def _candidate_rows(conn: sqlite3.Connection, started_at: float) -> list[sqlite3
                s.price_usd, s.liquidity_usd, s.buys_m5, s.sells_m5,
                s.buy_sell_ratio_m5, s.source, s.arlobit_score,
                s.age_minutes, s.creator_quality, s.top10_pct, s.top20_pct
-        FROM token_velocity tv
+        FROM v3_shadow_velocity tv
         JOIN candidate_sightings s ON s.sighting_id = tv.sighting_id
         WHERE tv.seen_at >= ?
         ORDER BY tv.seen_at, tv.mint
@@ -212,9 +212,11 @@ def evaluate_forward_window(conn: sqlite3.Connection, lower_bound: float | None 
     It writes only to v3_shadow_trades and never affects scanner verdicts,
     alerts, current paper trades, or score.
     """
-    velocity.refresh(conn)
     started_at = ensure_started(conn)
-    since = max(started_at, lower_bound) if lower_bound is not None else started_at
+    velocity.refresh_v3_shadow_velocity(conn, started_at)
+    # Forward velocity for a sighting is only knowable after a later same-mint
+    # observation arrives, so a cycle-only lower bound can miss just-matured rows.
+    since = started_at
     rows = _candidate_rows(conn, since)
     now = _now()
     rule_1_matches = 0
@@ -381,7 +383,6 @@ def update_outcomes(conn: sqlite3.Connection) -> int:
 
 
 def refresh(conn: sqlite3.Connection) -> tuple[int, int, float]:
-    velocity.refresh(conn)
     started_at = ensure_started(conn)
     counters = evaluate_forward_window(conn)
     return counters.shadow_inserted, counters.outcomes_updated, started_at
@@ -463,7 +464,7 @@ def _audit_rows(conn: sqlite3.Connection, started_at: float) -> list[sqlite3.Row
         SELECT tv.mint, tv.sighting_id, tv.seen_at,
                tv.price_change_velocity, tv.buy_sell_ratio_change,
                s.buy_sell_ratio_m5
-        FROM token_velocity tv
+        FROM v3_shadow_velocity tv
         JOIN candidate_sightings s ON s.sighting_id = tv.sighting_id
         WHERE tv.seen_at >= ?
         ORDER BY tv.seen_at, tv.mint
@@ -577,7 +578,7 @@ def _audit_report(conn: sqlite3.Connection, started_at: float) -> list[str]:
     missing_price = len(rows) - price_available
     missing_ratio_change = len(rows) - ratio_change_available
     blockers = [
-        ("no token_velocity row for sighting", missing_velocity_rows),
+        ("no v3_shadow_velocity row for sighting", missing_velocity_rows),
         ("price_change_velocity unavailable", missing_price),
         ("buy_sell_ratio_change unavailable", missing_ratio_change),
         ("candidate.buy_sell_ratio_m5 unavailable", len(rows) - current_ratio_available),
@@ -587,16 +588,28 @@ def _audit_report(conn: sqlite3.Connection, started_at: float) -> list[str]:
     ]
     top_blocker = max(blockers, key=lambda item: item[1]) if blockers else ("-", 0)
 
+    if rule_1_matches or rule_2_matches:
+        conclusion = (
+            "Conclusion: v3_shadow_velocity now covers forward sightings and active rules are producing "
+            "shadow-only matches."
+        )
+    elif missing_velocity_rows:
+        conclusion = "Conclusion: current forward zero matches are caused by missing per-sighting velocity rows."
+    elif price_available == 0 or ratio_change_available == 0:
+        conclusion = "Conclusion: current forward zero matches are caused by missing forward velocity values."
+    else:
+        conclusion = "Conclusion: current forward zero matches are caused by active rule strictness."
+
     return [
         "",
         "Forward strictness audit:",
         f"- new candidate sightings since forward_start: {new_candidates}",
-        f"- candidate sightings with token_velocity rows: {len(rows)}",
+        f"- candidate sightings with v3_shadow_velocity rows: {len(rows)}",
         f"- velocity.price_change_velocity available: {price_available}",
         f"- velocity.buy_sell_ratio_change available: {ratio_change_available}",
         f"- candidate.buy_sell_ratio_m5 available on velocity rows: {current_ratio_available}",
         "",
-        "Condition pass counts on forward token_velocity rows:",
+        "Condition pass counts on forward v3_shadow_velocity rows:",
         f"- velocity.price_change_velocity > 0.04: {price_velocity_gt_004}",
         f"- velocity.buy_sell_ratio_change > -0.05: {ratio_change_gt_neg005}",
         f"- velocity.buy_sell_ratio_change <= 0.13: {ratio_change_lte_013}",
@@ -619,7 +632,7 @@ def _audit_report(conn: sqlite3.Connection, started_at: float) -> list[str]:
         "- v3_rule_4 proposal: velocity.buy_sell_ratio_change in (-0.25, 0.25] AND candidate.buy_sell_ratio_m5 in (0.45, 0.75]",
         f"  forward estimate with current feature availability: {relaxed_rule_4} matches ({_per_day(relaxed_rule_4, days)}/day)",
         f"  historical support once velocity values exist: {historical_rule_4} matches ({_per_day(historical_rule_4, historical_days)}/day)",
-        "Conclusion: current forward zero matches are caused by missing forward velocity values before rule strictness can be measured.",
+        conclusion,
     ]
 
 

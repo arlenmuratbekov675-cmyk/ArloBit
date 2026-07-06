@@ -44,7 +44,10 @@ except Exception:  # paper trading must keep working even if the DB module can't
 try:
     from arlobit import v3_shadow
 except Exception:  # v3 shadow research logging must never break scanning
+    v3_shadow_import_error = sys.exc_info()[1]
     v3_shadow = None
+else:
+    v3_shadow_import_error = None
 
 
 BASE_URL = "https://api.dexscreener.com"
@@ -2803,6 +2806,8 @@ def run_scan_once(args: argparse.Namespace) -> ScanResult:
             v3_shadow_inserted = counters.shadow_inserted
         except Exception as exc:
             issues.append(f"v3_shadow: {exc}")
+    elif v3_shadow_import_error is not None:
+        issues.append(f"v3_shadow_import: {v3_shadow_import_error}")
     result = ScanResult(
         rows=rows,
         issues=issues,

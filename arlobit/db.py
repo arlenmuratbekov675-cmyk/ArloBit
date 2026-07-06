@@ -19,7 +19,7 @@ import os
 import sqlite3
 
 DEFAULT_DB_PATH = os.path.join("data", "arlobit.db")
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 OUTCOME_CHECKPOINTS_MIN = (5, 15, 30, 60, 120, 360, 720, 1440)
 
@@ -337,6 +337,35 @@ CREATE INDEX IF NOT EXISTS idx_velocity_signals_feature ON velocity_signals(feat
 CREATE INDEX IF NOT EXISTS idx_velocity_signals_pump ON velocity_signals(reached_100_rate);
 CREATE INDEX IF NOT EXISTS idx_velocity_signals_rug ON velocity_signals(rug_rate);
 
+CREATE TABLE IF NOT EXISTS v3_shadow_velocity (
+    sighting_id             INTEGER PRIMARY KEY REFERENCES candidate_sightings(sighting_id),
+    mint                    TEXT NOT NULL REFERENCES tokens(mint),
+    seen_at                 REAL,
+    computed_at             REAL NOT NULL,
+    liquidity_change_5m     REAL,
+    liquidity_change_15m    REAL,
+    liquidity_change_1h     REAL,
+    volume_change_5m        REAL,
+    volume_change_15m       REAL,
+    volume_change_1h        REAL,
+    buy_count_change        REAL,
+    sell_count_change       REAL,
+    buy_sell_ratio_change   REAL,
+    price_change_velocity   REAL,
+    volume_acceleration     REAL,
+    liquidity_acceleration  REAL,
+    reached_50              INTEGER,
+    reached_100             INTEGER,
+    reached_500             INTEGER,
+    rugged                  INTEGER,
+    ret_24h                 REAL,
+    max_runup_pct           REAL,
+    max_drawdown_pct        REAL,
+    label_version           INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_v3_shadow_velocity_mint_time ON v3_shadow_velocity(mint, seen_at);
+CREATE INDEX IF NOT EXISTS idx_v3_shadow_velocity_seen_at ON v3_shadow_velocity(seen_at);
+
 CREATE TABLE IF NOT EXISTS v3_shadow_trades (
     shadow_trade_id       INTEGER PRIMARY KEY,
     mint                  TEXT NOT NULL REFERENCES tokens(mint),
@@ -607,6 +636,39 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             CREATE INDEX IF NOT EXISTS idx_v3_shadow_status ON v3_shadow_trades(status);
             """
         )
+    if version < 8:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS v3_shadow_velocity (
+                sighting_id             INTEGER PRIMARY KEY REFERENCES candidate_sightings(sighting_id),
+                mint                    TEXT NOT NULL REFERENCES tokens(mint),
+                seen_at                 REAL,
+                computed_at             REAL NOT NULL,
+                liquidity_change_5m     REAL,
+                liquidity_change_15m    REAL,
+                liquidity_change_1h     REAL,
+                volume_change_5m        REAL,
+                volume_change_15m       REAL,
+                volume_change_1h        REAL,
+                buy_count_change        REAL,
+                sell_count_change       REAL,
+                buy_sell_ratio_change   REAL,
+                price_change_velocity   REAL,
+                volume_acceleration     REAL,
+                liquidity_acceleration  REAL,
+                reached_50              INTEGER,
+                reached_100             INTEGER,
+                reached_500             INTEGER,
+                rugged                  INTEGER,
+                ret_24h                 REAL,
+                max_runup_pct           REAL,
+                max_drawdown_pct        REAL,
+                label_version           INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_v3_shadow_velocity_mint_time ON v3_shadow_velocity(mint, seen_at);
+            CREATE INDEX IF NOT EXISTS idx_v3_shadow_velocity_seen_at ON v3_shadow_velocity(seen_at);
+            """
+        )
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     conn.commit()
 
@@ -629,6 +691,7 @@ def summary(conn: sqlite3.Connection) -> list[tuple[str, int]]:
         "axiom_signals",
         "token_velocity",
         "velocity_signals",
+        "v3_shadow_velocity",
         "v3_shadow_trades",
     )
     return [(table, conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in tables]

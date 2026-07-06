@@ -119,6 +119,19 @@ def _target_sightings(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return sorted(rows, key=lambda row: (row["mint"], row["seen_at"], row["sighting_id"]))
 
 
+def _candidate_sightings_since(conn: sqlite3.Connection, started_at: float) -> list[sqlite3.Row]:
+    conn.row_factory = sqlite3.Row
+    return conn.execute(
+        """
+        SELECT *
+        FROM candidate_sightings
+        WHERE seen_at >= ?
+        ORDER BY mint, seen_at, sighting_id
+        """,
+        (started_at,),
+    ).fetchall()
+
+
 def _history_by_mint(conn: sqlite3.Connection) -> dict[str, list[sqlite3.Row]]:
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
@@ -169,6 +182,68 @@ def _labels_by_mint(conn: sqlite3.Connection) -> dict[str, sqlite3.Row]:
     }
 
 
+def _velocity_values_for_target(
+    target: sqlite3.Row,
+    history: list[sqlite3.Row],
+    labels: dict[str, sqlite3.Row],
+    computed_at: float,
+) -> tuple[Any, ...]:
+    observations = {
+        name: _window_observation(history, target["seen_at"], seconds)
+        for name, seconds in WINDOW_SECONDS.items()
+    }
+    nearest = _nearest_next(history, target["seen_at"])
+
+    liquidity_change_5m = _pct_change(observations["5m"]["liquidity_usd"] if observations["5m"] else None, target["liquidity_usd"])
+    liquidity_change_15m = _pct_change(observations["15m"]["liquidity_usd"] if observations["15m"] else None, target["liquidity_usd"])
+    liquidity_change_1h = _pct_change(observations["1h"]["liquidity_usd"] if observations["1h"] else None, target["liquidity_usd"])
+    volume_change_5m = _pct_change(observations["5m"]["vol_m5"] if observations["5m"] else None, target["vol_m5"])
+    volume_change_15m = _pct_change(observations["15m"]["vol_m5"] if observations["15m"] else None, target["vol_m5"])
+    volume_change_1h = _pct_change(observations["1h"]["vol_m5"] if observations["1h"] else None, target["vol_m5"])
+    buy_count_change = _diff(nearest["buys_m5"] if nearest else None, target["buys_m5"])
+    sell_count_change = _diff(nearest["sells_m5"] if nearest else None, target["sells_m5"])
+    buy_sell_ratio_change = _diff(nearest["buy_sell_ratio_m5"] if nearest else None, target["buy_sell_ratio_m5"])
+    price_velocity = None
+    if nearest and nearest["seen_at"] > target["seen_at"]:
+        price_change = _pct_change(nearest["price_usd"], target["price_usd"])
+        price_velocity = _rate(price_change, (nearest["seen_at"] - target["seen_at"]) / 60.0)
+
+    volume_acceleration = _num(target["vol_accel"])
+    if volume_acceleration is None:
+        short_rate = _rate(volume_change_5m, 5)
+        med_rate = _rate(volume_change_15m, 15)
+        volume_acceleration = _diff(short_rate, med_rate)
+    liquidity_acceleration = _diff(_rate(liquidity_change_5m, 5), _rate(liquidity_change_15m, 15))
+
+    label = labels.get(target["mint"])
+    return (
+        target["mint"],
+        target["sighting_id"],
+        target["seen_at"],
+        computed_at,
+        liquidity_change_5m,
+        liquidity_change_15m,
+        liquidity_change_1h,
+        volume_change_5m,
+        volume_change_15m,
+        volume_change_1h,
+        buy_count_change,
+        sell_count_change,
+        buy_sell_ratio_change,
+        price_velocity,
+        volume_acceleration,
+        liquidity_acceleration,
+        label["reached_50"] if label else None,
+        label["reached_100"] if label else None,
+        label["reached_500"] if label else None,
+        label["rugged"] if label else None,
+        label["ret_24h"] if label else None,
+        label["max_runup_pct"] if label else None,
+        label["max_drawdown_pct"] if label else None,
+        label["label_version"] if label else None,
+    )
+
+
 def compute_velocity_rows(conn: sqlite3.Connection) -> list[tuple[Any, ...]]:
     history_by_mint = _history_by_mint(conn)
     targets = _target_sightings(conn)
@@ -176,64 +251,19 @@ def compute_velocity_rows(conn: sqlite3.Connection) -> list[tuple[Any, ...]]:
     computed_at = time.time()
     rows: list[tuple[Any, ...]] = []
     for target in targets:
-        mint = target["mint"]
-        history = history_by_mint.get(mint, [])
-        observations = {
-            name: _window_observation(history, target["seen_at"], seconds)
-            for name, seconds in WINDOW_SECONDS.items()
-        }
-        nearest = _nearest_next(history, target["seen_at"])
+        rows.append(_velocity_values_for_target(target, history_by_mint.get(target["mint"], []), labels, computed_at))
+    return rows
 
-        liquidity_change_5m = _pct_change(observations["5m"]["liquidity_usd"] if observations["5m"] else None, target["liquidity_usd"])
-        liquidity_change_15m = _pct_change(observations["15m"]["liquidity_usd"] if observations["15m"] else None, target["liquidity_usd"])
-        liquidity_change_1h = _pct_change(observations["1h"]["liquidity_usd"] if observations["1h"] else None, target["liquidity_usd"])
-        volume_change_5m = _pct_change(observations["5m"]["vol_m5"] if observations["5m"] else None, target["vol_m5"])
-        volume_change_15m = _pct_change(observations["15m"]["vol_m5"] if observations["15m"] else None, target["vol_m5"])
-        volume_change_1h = _pct_change(observations["1h"]["vol_m5"] if observations["1h"] else None, target["vol_m5"])
-        buy_count_change = _diff(nearest["buys_m5"] if nearest else None, target["buys_m5"])
-        sell_count_change = _diff(nearest["sells_m5"] if nearest else None, target["sells_m5"])
-        buy_sell_ratio_change = _diff(nearest["buy_sell_ratio_m5"] if nearest else None, target["buy_sell_ratio_m5"])
-        price_velocity = None
-        if nearest and nearest["seen_at"] > target["seen_at"]:
-            price_change = _pct_change(nearest["price_usd"], target["price_usd"])
-            price_velocity = _rate(price_change, (nearest["seen_at"] - target["seen_at"]) / 60.0)
 
-        volume_acceleration = _num(target["vol_accel"])
-        if volume_acceleration is None:
-            short_rate = _rate(volume_change_5m, 5)
-            med_rate = _rate(volume_change_15m, 15)
-            volume_acceleration = _diff(short_rate, med_rate)
-        liquidity_acceleration = _diff(_rate(liquidity_change_5m, 5), _rate(liquidity_change_15m, 15))
-
-        label = labels.get(mint)
-        rows.append(
-            (
-                mint,
-                target["sighting_id"],
-                target["seen_at"],
-                computed_at,
-                liquidity_change_5m,
-                liquidity_change_15m,
-                liquidity_change_1h,
-                volume_change_5m,
-                volume_change_15m,
-                volume_change_1h,
-                buy_count_change,
-                sell_count_change,
-                buy_sell_ratio_change,
-                price_velocity,
-                volume_acceleration,
-                liquidity_acceleration,
-                label["reached_50"] if label else None,
-                label["reached_100"] if label else None,
-                label["reached_500"] if label else None,
-                label["rugged"] if label else None,
-                label["ret_24h"] if label else None,
-                label["max_runup_pct"] if label else None,
-                label["max_drawdown_pct"] if label else None,
-                label["label_version"] if label else None,
-            )
-        )
+def compute_v3_shadow_velocity_rows(conn: sqlite3.Connection, started_at: float) -> list[tuple[Any, ...]]:
+    history_by_mint = _history_by_mint(conn)
+    targets = _candidate_sightings_since(conn, started_at)
+    labels = _labels_by_mint(conn)
+    computed_at = time.time()
+    rows: list[tuple[Any, ...]] = []
+    for target in targets:
+        values = _velocity_values_for_target(target, history_by_mint.get(target["mint"], []), labels, computed_at)
+        rows.append((values[1], values[0], *values[2:]))
     return rows
 
 
@@ -244,6 +274,29 @@ def refresh_token_velocity(conn: sqlite3.Connection) -> int:
         """
         INSERT INTO token_velocity (
             mint, sighting_id, seen_at, computed_at,
+            liquidity_change_5m, liquidity_change_15m, liquidity_change_1h,
+            volume_change_5m, volume_change_15m, volume_change_1h,
+            buy_count_change, sell_count_change, buy_sell_ratio_change,
+            price_change_velocity, volume_acceleration, liquidity_acceleration,
+            reached_50, reached_100, reached_500, rugged,
+            ret_24h, max_runup_pct, max_drawdown_pct, label_version
+        )
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        rows,
+    )
+    conn.commit()
+    return len(rows)
+
+
+def refresh_v3_shadow_velocity(conn: sqlite3.Connection, started_at: float) -> int:
+    """Refresh per-sighting forward velocity rows for V3 shadow research."""
+    rows = compute_v3_shadow_velocity_rows(conn, started_at)
+    conn.execute("DELETE FROM v3_shadow_velocity WHERE seen_at >= ?", (started_at,))
+    conn.executemany(
+        """
+        INSERT INTO v3_shadow_velocity (
+            sighting_id, mint, seen_at, computed_at,
             liquidity_change_5m, liquidity_change_15m, liquidity_change_1h,
             volume_change_5m, volume_change_15m, volume_change_1h,
             buy_count_change, sell_count_change, buy_sell_ratio_change,
