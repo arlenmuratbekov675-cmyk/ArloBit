@@ -19,7 +19,7 @@ import os
 import sqlite3
 
 DEFAULT_DB_PATH = os.path.join("data", "arlobit.db")
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 OUTCOME_CHECKPOINTS_MIN = (5, 15, 30, 60, 120, 360, 720, 1440)
 
@@ -337,6 +337,27 @@ CREATE INDEX IF NOT EXISTS idx_velocity_signals_feature ON velocity_signals(feat
 CREATE INDEX IF NOT EXISTS idx_velocity_signals_pump ON velocity_signals(reached_100_rate);
 CREATE INDEX IF NOT EXISTS idx_velocity_signals_rug ON velocity_signals(rug_rate);
 
+CREATE TABLE IF NOT EXISTS v3_shadow_trades (
+    shadow_trade_id       INTEGER PRIMARY KEY,
+    mint                  TEXT NOT NULL REFERENCES tokens(mint),
+    sighting_id           INTEGER REFERENCES candidate_sightings(sighting_id),
+    entry_time            REAL NOT NULL,
+    rule_id               TEXT NOT NULL,
+    features_json         TEXT NOT NULL,
+    exit_result           TEXT,
+    tp_sl_result          TEXT,
+    max_drawdown_pct      REAL,
+    max_runup_pct         REAL,
+    ret_24h               REAL,
+    status                TEXT NOT NULL DEFAULT 'open',
+    created_at            REAL NOT NULL,
+    updated_at            REAL NOT NULL,
+    UNIQUE(mint, rule_id)
+);
+CREATE INDEX IF NOT EXISTS idx_v3_shadow_entry_time ON v3_shadow_trades(entry_time);
+CREATE INDEX IF NOT EXISTS idx_v3_shadow_rule ON v3_shadow_trades(rule_id);
+CREATE INDEX IF NOT EXISTS idx_v3_shadow_status ON v3_shadow_trades(status);
+
 CREATE VIEW IF NOT EXISTS ml_dataset AS
 SELECT s.*,
        t.pair_created_at, t.first_source,
@@ -561,6 +582,31 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             CREATE INDEX IF NOT EXISTS idx_velocity_signals_rug ON velocity_signals(rug_rate);
             """
         )
+    if version < 7:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS v3_shadow_trades (
+                shadow_trade_id       INTEGER PRIMARY KEY,
+                mint                  TEXT NOT NULL REFERENCES tokens(mint),
+                sighting_id           INTEGER REFERENCES candidate_sightings(sighting_id),
+                entry_time            REAL NOT NULL,
+                rule_id               TEXT NOT NULL,
+                features_json         TEXT NOT NULL,
+                exit_result           TEXT,
+                tp_sl_result          TEXT,
+                max_drawdown_pct      REAL,
+                max_runup_pct         REAL,
+                ret_24h               REAL,
+                status                TEXT NOT NULL DEFAULT 'open',
+                created_at            REAL NOT NULL,
+                updated_at            REAL NOT NULL,
+                UNIQUE(mint, rule_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_v3_shadow_entry_time ON v3_shadow_trades(entry_time);
+            CREATE INDEX IF NOT EXISTS idx_v3_shadow_rule ON v3_shadow_trades(rule_id);
+            CREATE INDEX IF NOT EXISTS idx_v3_shadow_status ON v3_shadow_trades(status);
+            """
+        )
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     conn.commit()
 
@@ -583,6 +629,7 @@ def summary(conn: sqlite3.Connection) -> list[tuple[str, int]]:
         "axiom_signals",
         "token_velocity",
         "velocity_signals",
+        "v3_shadow_trades",
     )
     return [(table, conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in tables]
 
