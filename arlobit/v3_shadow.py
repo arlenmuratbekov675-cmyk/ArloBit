@@ -29,24 +29,44 @@ SL_PCT = -50.0
 class Rule:
     rule_id: str
     description: str
+    start_meta_key: str | None = None
 
     def matches(self, row: sqlite3.Row) -> bool:
         price_velocity = _num(row["price_change_velocity"])
         ratio_change = _num(row["buy_sell_ratio_change"])
         current_ratio = _num(row["buy_sell_ratio_m5"])
+        liquidity = _num(row["liquidity_usd"])
+        age_minutes = _num(row["age_minutes"])
+        creator_quality = row["creator_quality"]
+        rule_1_base = (
+            price_velocity is not None
+            and price_velocity > 0.04
+            and ratio_change is not None
+            and -0.05 < ratio_change <= 0.13
+        )
         if self.rule_id == "v3_rule_1":
-            return (
-                price_velocity is not None
-                and price_velocity > 0.04
-                and ratio_change is not None
-                and -0.05 < ratio_change <= 0.13
-            )
+            return rule_1_base
         if self.rule_id == "v3_rule_2":
             return (
                 ratio_change is not None
                 and -0.05 < ratio_change <= 0.13
                 and current_ratio is not None
                 and 0.55 < current_ratio <= 0.64
+            )
+        if self.rule_id == "v3_rule_1_tight_a":
+            return (
+                rule_1_base
+                and liquidity is not None
+                and liquidity > 12919
+                and creator_quality != "risky"
+            )
+        if self.rule_id == "v3_rule_1_tight_b":
+            return (
+                rule_1_base
+                and liquidity is not None
+                and liquidity > 12919
+                and age_minutes is not None
+                and age_minutes >= 1440
             )
         return False
 
@@ -68,6 +88,16 @@ RULES = (
     Rule(
         "v3_rule_2",
         "velocity.buy_sell_ratio_change=(-0.05, 0.13] AND candidate.buy_sell_ratio_m5=(0.55, 0.64]",
+    ),
+    Rule(
+        "v3_rule_1_tight_a",
+        "v3_rule_1 AND candidate.liquidity_usd > 12919 AND candidate.creator_quality != risky",
+        "v3_shadow_started_at_v3_rule_1_tight_a",
+    ),
+    Rule(
+        "v3_rule_1_tight_b",
+        "v3_rule_1 AND candidate.liquidity_usd > 12919 AND candidate.age_minutes >= 1440",
+        "v3_shadow_started_at_v3_rule_1_tight_b",
     ),
 )
 
@@ -128,6 +158,30 @@ def ensure_started(conn: sqlite3.Connection) -> float:
     return started_at
 
 
+def ensure_rule_started(conn: sqlite3.Connection, rule: Rule, default_started_at: float) -> float:
+    if rule.start_meta_key is None:
+        return ensure_started(conn)
+    row = conn.execute("SELECT value FROM paper_trade_meta WHERE key=?", (rule.start_meta_key,)).fetchone()
+    if row and row[0]:
+        parsed = _num(row[0])
+        if parsed is not None:
+            return parsed
+    conn.execute(
+        "INSERT INTO paper_trade_meta (key, value) VALUES (?, ?)"
+        " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (rule.start_meta_key, str(default_started_at)),
+    )
+    conn.commit()
+    return default_started_at
+
+
+def ensure_rule_starts(
+    conn: sqlite3.Connection,
+    default_started_at: float,
+) -> dict[str, float]:
+    return {rule.rule_id: ensure_rule_started(conn, rule, default_started_at) for rule in RULES}
+
+
 def _candidate_rows(conn: sqlite3.Connection, started_at: float) -> list[sqlite3.Row]:
     conn.row_factory = sqlite3.Row
     return conn.execute(
@@ -176,10 +230,13 @@ def _features_json(row: sqlite3.Row) -> str:
 
 def insert_new_shadow_trades(conn: sqlite3.Connection, started_at: float) -> int:
     rows = _candidate_rows(conn, started_at)
+    rule_starts = ensure_rule_starts(conn, started_at)
     now = _now()
     inserted = 0
     for row in rows:
         for rule in RULES:
+            if row["seen_at"] < rule_starts[rule.rule_id]:
+                continue
             if not rule.matches(row):
                 continue
             cursor = conn.execute(
@@ -213,6 +270,8 @@ def evaluate_forward_window(conn: sqlite3.Connection, lower_bound: float | None 
     alerts, current paper trades, or score.
     """
     started_at = ensure_started(conn)
+    default_rule_started_at = lower_bound if lower_bound is not None else _now()
+    rule_starts = ensure_rule_starts(conn, default_rule_started_at)
     velocity.refresh_v3_shadow_velocity(conn, started_at)
     # Forward velocity for a sighting is only knowable after a later same-mint
     # observation arrives, so a cycle-only lower bound can miss just-matured rows.
@@ -224,6 +283,8 @@ def evaluate_forward_window(conn: sqlite3.Connection, lower_bound: float | None 
     inserted = 0
     for row in rows:
         for rule in RULES:
+            if row["seen_at"] < rule_starts[rule.rule_id]:
+                continue
             if not rule.matches(row):
                 continue
             if rule.rule_id == "v3_rule_1":
@@ -392,6 +453,16 @@ def _avg(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
 
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    midpoint = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[midpoint]
+    return (ordered[midpoint - 1] + ordered[midpoint]) / 2
+
+
 def _profit_factor(values: list[float]) -> float | None:
     wins = sum(value for value in values if value > 0)
     losses = -sum(value for value in values if value < 0)
@@ -405,7 +476,7 @@ def _profit_factor(values: list[float]) -> float | None:
 def _rule_summary(conn: sqlite3.Connection) -> list[str]:
     conn.row_factory = sqlite3.Row
     lines = [
-        "rule_id     total open closed avg_ret_24h profit_factor avg_runup avg_drawdown tp100 sl50 rug_rate",
+        "rule_id              total open closed avg_ret median_ret profit_factor rug_rate avg_drawdown avg_runup",
     ]
     for rule in RULES:
         rows = conn.execute(
@@ -422,11 +493,12 @@ def _rule_summary(conn: sqlite3.Connection) -> list[str]:
         rugs = sum(1 for row in closed if row["exit_result"] == "rugged")
         closed_n = len(closed)
         lines.append(
-            f"{rule.rule_id:<10} {len(rows):>5} {len(rows) - closed_n:>4} {closed_n:>6}"
-            f" {_fmt(_avg(returns)):>11} {_fmt(_profit_factor(returns)):>13}"
-            f" {_fmt(_avg([v for v in runups if v is not None])):>9}"
+            f"{rule.rule_id:<20} {len(rows):>5} {len(rows) - closed_n:>4} {closed_n:>6}"
+            f" {_fmt(_avg(returns)):>7} {_fmt(_median(returns)):>10}"
+            f" {_fmt(_profit_factor(returns)):>13}"
+            f" {_pct(rugs / closed_n if closed_n else None):>8}"
             f" {_fmt(_avg([v for v in drawdowns if v is not None])):>12}"
-            f" {tp100:>5} {sl50:>4} {_pct(rugs / closed_n if closed_n else None):>8}"
+            f" {_fmt(_avg([v for v in runups if v is not None])):>9}"
         )
     return lines
 
@@ -463,7 +535,8 @@ def _audit_rows(conn: sqlite3.Connection, started_at: float) -> list[sqlite3.Row
         """
         SELECT tv.mint, tv.sighting_id, tv.seen_at,
                tv.price_change_velocity, tv.buy_sell_ratio_change,
-               s.buy_sell_ratio_m5
+               s.buy_sell_ratio_m5, s.liquidity_usd, s.age_minutes,
+               s.creator_quality
         FROM v3_shadow_velocity tv
         JOIN candidate_sightings s ON s.sighting_id = tv.sighting_id
         WHERE tv.seen_at >= ?
@@ -547,7 +620,8 @@ def _audit_report(conn: sqlite3.Connection, started_at: float) -> list[str]:
         """
         SELECT tv.mint, tv.sighting_id, tv.seen_at,
                tv.price_change_velocity, tv.buy_sell_ratio_change,
-               s.buy_sell_ratio_m5
+               s.buy_sell_ratio_m5, s.liquidity_usd, s.age_minutes,
+               s.creator_quality
         FROM token_velocity tv
         JOIN candidate_sightings s ON s.sighting_id = tv.sighting_id
         ORDER BY tv.seen_at, tv.mint
