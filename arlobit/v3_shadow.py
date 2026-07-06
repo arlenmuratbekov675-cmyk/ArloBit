@@ -51,6 +51,15 @@ class Rule:
         return False
 
 
+@dataclass(frozen=True)
+class ShadowCounters:
+    candidates_evaluated: int = 0
+    rule_1_matches: int = 0
+    rule_2_matches: int = 0
+    shadow_inserted: int = 0
+    outcomes_updated: int = 0
+
+
 RULES = (
     Rule(
         "v3_rule_1",
@@ -190,6 +199,59 @@ def insert_new_shadow_trades(conn: sqlite3.Connection, started_at: float) -> int
     return inserted
 
 
+def evaluate_forward_window(conn: sqlite3.Connection, lower_bound: float | None = None) -> ShadowCounters:
+    """Evaluate v3 shadow rules for forward research rows.
+
+    Intended for scanner hooks after candidate_sightings have been persisted.
+    It writes only to v3_shadow_trades and never affects scanner verdicts,
+    alerts, current paper trades, or score.
+    """
+    velocity.refresh(conn)
+    started_at = ensure_started(conn)
+    since = max(started_at, lower_bound) if lower_bound is not None else started_at
+    rows = _candidate_rows(conn, since)
+    now = _now()
+    rule_1_matches = 0
+    rule_2_matches = 0
+    inserted = 0
+    for row in rows:
+        for rule in RULES:
+            if not rule.matches(row):
+                continue
+            if rule.rule_id == "v3_rule_1":
+                rule_1_matches += 1
+            elif rule.rule_id == "v3_rule_2":
+                rule_2_matches += 1
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO v3_shadow_trades (
+                    mint, sighting_id, entry_time, rule_id, features_json,
+                    status, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, 'open', ?, ?)
+                """,
+                (
+                    row["mint"],
+                    row["sighting_id"],
+                    row["seen_at"],
+                    rule.rule_id,
+                    _features_json(row),
+                    now,
+                    now,
+                ),
+            )
+            inserted += cursor.rowcount
+    conn.commit()
+    updated = update_outcomes(conn)
+    return ShadowCounters(
+        candidates_evaluated=len(rows),
+        rule_1_matches=rule_1_matches,
+        rule_2_matches=rule_2_matches,
+        shadow_inserted=inserted,
+        outcomes_updated=updated,
+    )
+
+
 def _label_by_mint(conn: sqlite3.Connection) -> dict[str, sqlite3.Row]:
     conn.row_factory = sqlite3.Row
     return {
@@ -315,9 +377,8 @@ def update_outcomes(conn: sqlite3.Connection) -> int:
 def refresh(conn: sqlite3.Connection) -> tuple[int, int, float]:
     velocity.refresh(conn)
     started_at = ensure_started(conn)
-    inserted = insert_new_shadow_trades(conn, started_at)
-    updated = update_outcomes(conn)
-    return inserted, updated, started_at
+    counters = evaluate_forward_window(conn)
+    return counters.shadow_inserted, counters.outcomes_updated, started_at
 
 
 def _avg(values: list[float]) -> float | None:
@@ -402,7 +463,7 @@ def report_lines(conn: sqlite3.Connection) -> list[str]:
     ).fetchone()
     lines = [
         "=== ARLOBIT V3 SHADOW REPORT ===",
-        "paper-only shadow strategy; not connected to scanner, live trading, current paper strategy, or scoring",
+        "paper-only shadow strategy; scanner-connected research logging only, not connected to live trading, current paper strategy, or scoring",
         f"forward start: {_iso(started_at)}",
         f"planned window end: {_iso(stop_at)}",
         f"new entries this run: {inserted}",

@@ -41,6 +41,11 @@ try:
 except Exception:  # paper trading must keep working even if the DB module can't load
     paper_store = None
 
+try:
+    from arlobit import v3_shadow
+except Exception:  # v3 shadow research logging must never break scanning
+    v3_shadow = None
+
 
 BASE_URL = "https://api.dexscreener.com"
 SOLANA = "solana"
@@ -236,6 +241,10 @@ class ScanResult:
     paper_opened: int
     paper_closed: int
     blocked_paper_reason_counts: dict[str, int]
+    v3_candidates_evaluated: int = 0
+    v3_rule_1_matches: int = 0
+    v3_rule_2_matches: int = 0
+    v3_shadow_inserted: int = 0
 
 
 def number(value: Any, default: float = 0.0) -> float:
@@ -2690,6 +2699,10 @@ def print_health(result: ScanResult) -> None:
         f"alerts_sent={result.alerts_sent} "
         f"paper_opened={result.paper_opened} "
         f"paper_closed={result.paper_closed} "
+        f"v3_candidates_evaluated={result.v3_candidates_evaluated} "
+        f"v3_rule_1_matches={result.v3_rule_1_matches} "
+        f"v3_rule_2_matches={result.v3_rule_2_matches} "
+        f"v3_shadow_inserted={result.v3_shadow_inserted} "
         f"{blocked_counts} "
         f"api_rpc_errors={error_count}"
     )
@@ -2697,6 +2710,7 @@ def print_health(result: ScanResult) -> None:
 
 def run_scan_once(args: argparse.Namespace) -> ScanResult:
     session = build_session()
+    cycle_started_at = time.time()
     if research:
         research.begin_cycle(args.min_age_minutes, args.max_age_hours, scanner_version="0.9.4")
     paper_closed, paper_issues, paper_close_messages = update_and_save_paper_trades(session, args.timeout)
@@ -2770,6 +2784,25 @@ def run_scan_once(args: argparse.Namespace) -> ScanResult:
             pairs_scanned=pairs_scanned,
             blocked_reasons_fn=paper_entry_blocked_reasons,
         )
+    v3_candidates_evaluated = 0
+    v3_rule_1_matches = 0
+    v3_rule_2_matches = 0
+    v3_shadow_inserted = 0
+    if v3_shadow is not None:
+        try:
+            from arlobit import db as research_db
+
+            conn = research_db.connect()
+            try:
+                counters = v3_shadow.evaluate_forward_window(conn, lower_bound=cycle_started_at)
+            finally:
+                conn.close()
+            v3_candidates_evaluated = counters.candidates_evaluated
+            v3_rule_1_matches = counters.rule_1_matches
+            v3_rule_2_matches = counters.rule_2_matches
+            v3_shadow_inserted = counters.shadow_inserted
+        except Exception as exc:
+            issues.append(f"v3_shadow: {exc}")
     result = ScanResult(
         rows=rows,
         issues=issues,
@@ -2780,6 +2813,10 @@ def run_scan_once(args: argparse.Namespace) -> ScanResult:
         paper_opened=paper_opened,
         paper_closed=paper_closed,
         blocked_paper_reason_counts=blocked_paper_reason_counts,
+        v3_candidates_evaluated=v3_candidates_evaluated,
+        v3_rule_1_matches=v3_rule_1_matches,
+        v3_rule_2_matches=v3_rule_2_matches,
+        v3_shadow_inserted=v3_shadow_inserted,
     )
     print_health(result)
 
@@ -2834,7 +2871,11 @@ def run_loop(args: argparse.Namespace) -> int:
                 run_scan_once(args)
             except Exception as exc:
                 print(f"[{timestamp()}] Scan cycle {cycle} failed: {exc}", file=sys.stderr)
-                print("Health: pairs_scanned=0 candidates_found=0 safe_count=0 alerts_sent=0 api_rpc_errors=1")
+                print(
+                    "Health: pairs_scanned=0 candidates_found=0 safe_count=0 alerts_sent=0 "
+                    "paper_opened=0 paper_closed=0 v3_candidates_evaluated=0 "
+                    "v3_rule_1_matches=0 v3_rule_2_matches=0 v3_shadow_inserted=0 api_rpc_errors=1"
+                )
 
             if args.cycles and cycle >= args.cycles:
                 print(f"[{timestamp()}] Loop cycle limit reached; exiting.")
