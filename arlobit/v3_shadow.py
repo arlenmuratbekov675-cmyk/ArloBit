@@ -48,6 +48,7 @@ class Rule:
         ratio_change = _num(row["buy_sell_ratio_change"])
         current_ratio = _num(row["buy_sell_ratio_m5"])
         liquidity = _num(row["liquidity_usd"])
+        volume_5m = _num(row["vol_m5"])
         age_minutes = _num(row["age_minutes"])
         creator_quality = row["creator_quality"]
         rule_1_base = (
@@ -79,6 +80,39 @@ class Rule:
                 and liquidity > 12919
                 and age_minutes is not None
                 and age_minutes >= 1440
+            )
+        if self.rule_id == "v3_rule_momentum_a":
+            return (
+                liquidity is not None
+                and liquidity >= 5000
+                and volume_5m is not None
+                and volume_5m >= 1000
+                and current_ratio is not None
+                and 0.45 <= current_ratio <= 0.75
+                and age_minutes is not None
+                and age_minutes >= 180
+            )
+        if self.rule_id == "v3_rule_momentum_b":
+            return (
+                liquidity is not None
+                and liquidity >= 5000
+                and volume_5m is not None
+                and volume_5m >= 2500
+                and current_ratio is not None
+                and 0.45 <= current_ratio <= 0.75
+                and age_minutes is not None
+                and age_minutes >= 180
+            )
+        if self.rule_id == "v3_rule_momentum_c":
+            return (
+                liquidity is not None
+                and liquidity >= 5000
+                and volume_5m is not None
+                and volume_5m >= 1000
+                and current_ratio is not None
+                and 0.50 <= current_ratio <= 0.80
+                and age_minutes is not None
+                and age_minutes >= 180
             )
         return False
 
@@ -135,6 +169,21 @@ RULES = (
         "v3_rule_1_tight_b",
         "v3_rule_1 AND candidate.liquidity_usd > 12919 AND candidate.age_minutes >= 1440",
         "v3_shadow_started_at_v3_rule_1_tight_b",
+    ),
+    Rule(
+        "v3_rule_momentum_a",
+        "candidate.liquidity_usd >= 5000 AND candidate.vol_m5 >= 1000 AND candidate.buy_sell_ratio_m5 BETWEEN 0.45 AND 0.75 AND candidate.age_minutes >= 180",
+        "v3_shadow_started_at_v3_rule_momentum_a",
+    ),
+    Rule(
+        "v3_rule_momentum_b",
+        "candidate.liquidity_usd >= 5000 AND candidate.vol_m5 >= 2500 AND candidate.buy_sell_ratio_m5 BETWEEN 0.45 AND 0.75 AND candidate.age_minutes >= 180",
+        "v3_shadow_started_at_v3_rule_momentum_b",
+    ),
+    Rule(
+        "v3_rule_momentum_c",
+        "candidate.liquidity_usd >= 5000 AND candidate.vol_m5 >= 1000 AND candidate.buy_sell_ratio_m5 BETWEEN 0.50 AND 0.80 AND candidate.age_minutes >= 180",
+        "v3_shadow_started_at_v3_rule_momentum_c",
     ),
 )
 
@@ -228,7 +277,7 @@ def _candidate_rows(conn: sqlite3.Connection, started_at: float) -> list[sqlite3
                tv.liquidity_change_15m, tv.liquidity_change_1h,
                tv.volume_change_15m, tv.volume_change_1h,
                tv.buy_count_change, tv.sell_count_change,
-               s.price_usd, s.liquidity_usd, s.buys_m5, s.sells_m5,
+               s.price_usd, s.liquidity_usd, s.vol_m5, s.buys_m5, s.sells_m5,
                s.buy_sell_ratio_m5, s.source, s.arlobit_score,
                s.age_minutes, s.creator_quality, s.top10_pct, s.top20_pct
         FROM v3_shadow_velocity tv
@@ -253,6 +302,7 @@ def _features_json(row: sqlite3.Row) -> str:
         "sell_count_change": _num(row["sell_count_change"]),
         "entry_price_usd": _num(row["price_usd"]),
         "liquidity_usd": _num(row["liquidity_usd"]),
+        "vol_m5": _num(row["vol_m5"]),
         "buys_m5": _num(row["buys_m5"]),
         "sells_m5": _num(row["sells_m5"]),
         "source": row["source"],
@@ -850,7 +900,7 @@ def _audit_rows(conn: sqlite3.Connection, started_at: float) -> list[sqlite3.Row
         """
         SELECT tv.mint, tv.sighting_id, tv.seen_at,
                tv.price_change_velocity, tv.buy_sell_ratio_change,
-               s.buy_sell_ratio_m5, s.liquidity_usd, s.age_minutes,
+               s.buy_sell_ratio_m5, s.liquidity_usd, s.vol_m5, s.age_minutes,
                s.creator_quality
         FROM v3_shadow_velocity tv
         JOIN candidate_sightings s ON s.sighting_id = tv.sighting_id
@@ -935,7 +985,7 @@ def _audit_report(conn: sqlite3.Connection, started_at: float) -> list[str]:
         """
         SELECT tv.mint, tv.sighting_id, tv.seen_at,
                tv.price_change_velocity, tv.buy_sell_ratio_change,
-               s.buy_sell_ratio_m5, s.liquidity_usd, s.age_minutes,
+               s.buy_sell_ratio_m5, s.liquidity_usd, s.vol_m5, s.age_minutes,
                s.creator_quality
         FROM token_velocity tv
         JOIN candidate_sightings s ON s.sighting_id = tv.sighting_id
