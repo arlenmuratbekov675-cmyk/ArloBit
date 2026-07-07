@@ -19,7 +19,7 @@ import os
 import sqlite3
 
 DEFAULT_DB_PATH = os.path.join("data", "arlobit.db")
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 OUTCOME_CHECKPOINTS_MIN = (5, 15, 30, 60, 120, 360, 720, 1440)
 
@@ -378,6 +378,8 @@ CREATE TABLE IF NOT EXISTS v3_shadow_trades (
     max_drawdown_pct      REAL,
     max_runup_pct         REAL,
     ret_24h               REAL,
+    coverage_pct          REAL,
+    outcome_quality       TEXT,
     status                TEXT NOT NULL DEFAULT 'open',
     created_at            REAL NOT NULL,
     updated_at            REAL NOT NULL,
@@ -626,6 +628,8 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
                 max_drawdown_pct      REAL,
                 max_runup_pct         REAL,
                 ret_24h               REAL,
+                coverage_pct          REAL,
+                outcome_quality       TEXT,
                 status                TEXT NOT NULL DEFAULT 'open',
                 created_at            REAL NOT NULL,
                 updated_at            REAL NOT NULL,
@@ -669,6 +673,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             CREATE INDEX IF NOT EXISTS idx_v3_shadow_velocity_seen_at ON v3_shadow_velocity(seen_at);
             """
         )
+    if version < 9:
+        _add_column_if_missing(conn, "v3_shadow_trades", "coverage_pct", "REAL")
+        _add_column_if_missing(conn, "v3_shadow_trades", "outcome_quality", "TEXT")
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     conn.commit()
 

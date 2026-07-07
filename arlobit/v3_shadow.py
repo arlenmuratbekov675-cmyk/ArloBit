@@ -23,6 +23,12 @@ START_META_KEY = "v3_shadow_started_at"
 WINDOW_DAYS = 14
 TP_PCT = 100.0
 SL_PCT = -50.0
+OUTCOME_WINDOW_SECONDS = 24 * 60 * 60
+EXPECTED_1M_CANDLES_24H = 1440
+CLEAN_COVERAGE_PCT = 80.0
+ENTRY_CANDLE_TOLERANCE_SECONDS = 120.0
+FINAL_CANDLE_TOLERANCE_SECONDS = 5 * 60.0
+MAX_CLEAN_GAP_SECONDS = 120.0
 
 
 @dataclass(frozen=True)
@@ -78,6 +84,19 @@ class ShadowCounters:
     rule_2_matches: int = 0
     shadow_inserted: int = 0
     outcomes_updated: int = 0
+
+
+@dataclass(frozen=True)
+class ShadowOutcome:
+    entry_price: float | None
+    final_price: float | None
+    ret_24h: float | None
+    max_runup_pct: float | None
+    max_drawdown_pct: float | None
+    coverage_pct: float
+    outcome_quality: str
+    tp_sl_result: str | None
+    exit_result: str | None
 
 
 RULES = (
@@ -321,22 +340,6 @@ def evaluate_forward_window(conn: sqlite3.Connection, lower_bound: float | None 
     )
 
 
-def _label_by_mint(conn: sqlite3.Connection) -> dict[str, sqlite3.Row]:
-    conn.row_factory = sqlite3.Row
-    return {
-        row["mint"]: row
-        for row in conn.execute(
-            """
-            SELECT mint, reached_50, reached_100, reached_500, rugged,
-                   ret_24h, max_runup_pct, max_drawdown_pct
-            FROM labels
-            WHERE label_version = ?
-            """,
-            (LABEL_VERSION,),
-        ).fetchall()
-    }
-
-
 def _entry_price(features_json: str) -> float | None:
     try:
         payload = json.loads(features_json)
@@ -347,21 +350,12 @@ def _entry_price(features_json: str) -> float | None:
     return _num(payload.get("entry_price_usd"))
 
 
-def _tp_sl_from_path(conn: sqlite3.Connection, mint: str, entry_time: float, entry_price: float | None) -> str | None:
+def _tp_sl_from_candles(candles: list[sqlite3.Row], entry_price: float | None) -> str | None:
     if entry_price is None or entry_price <= 0:
         return None
-    rows = conn.execute(
-        """
-        SELECT ts, high, low
-        FROM ohlcv_1m
-        WHERE mint = ? AND ts >= ? AND ts <= ?
-        ORDER BY ts
-        """,
-        (mint, entry_time, entry_time + 24 * 60 * 60),
-    ).fetchall()
-    for _ts, high, low in rows:
-        high_ret = None if high is None else (float(high) / entry_price - 1.0) * 100.0
-        low_ret = None if low is None else (float(low) / entry_price - 1.0) * 100.0
+    for candle in candles:
+        high_ret = None if candle["high"] is None else (float(candle["high"]) / entry_price - 1.0) * 100.0
+        low_ret = None if candle["low"] is None else (float(candle["low"]) / entry_price - 1.0) * 100.0
         if low_ret is not None and low_ret <= SL_PCT:
             return "SL_50"
         if high_ret is not None and high_ret >= TP_PCT:
@@ -369,51 +363,144 @@ def _tp_sl_from_path(conn: sqlite3.Connection, mint: str, entry_time: float, ent
     return None
 
 
-def _tp_sl_result(conn: sqlite3.Connection, trade: sqlite3.Row, label: sqlite3.Row | None) -> str | None:
-    path_result = _tp_sl_from_path(
-        conn,
-        trade["mint"],
-        float(trade["entry_time"]),
-        _entry_price(trade["features_json"]),
-    )
-    if path_result:
-        return path_result
-    if label is None:
-        return None
-    max_runup = _num(label["max_runup_pct"])
-    max_drawdown = _num(label["max_drawdown_pct"])
-    rugged = int(label["rugged"] == 1)
-    if max_runup is not None and max_runup >= TP_PCT:
-        return "TP_100_ORDER_UNKNOWN"
-    if rugged or (max_drawdown is not None and max_drawdown <= SL_PCT):
-        return "SL_50_ORDER_UNKNOWN"
-    return "NO_TP_OR_SL_24H"
-
-
-def _exit_result(label: sqlite3.Row | None) -> str | None:
-    if label is None or label["ret_24h"] is None:
-        return None
-    if label["rugged"] == 1:
+def _exit_result_from_outcome(outcome: ShadowOutcome) -> str | None:
+    if outcome.max_drawdown_pct is not None and outcome.max_drawdown_pct <= -90.0:
         return "rugged"
-    if label["reached_500"] == 1:
+    if outcome.max_runup_pct is not None and outcome.max_runup_pct >= 500.0:
         return "reached_500"
-    if label["reached_100"] == 1:
+    if outcome.max_runup_pct is not None and outcome.max_runup_pct >= 100.0:
         return "reached_100"
-    if label["reached_50"] == 1:
+    if outcome.max_runup_pct is not None and outcome.max_runup_pct >= 50.0:
         return "reached_50"
+    if outcome.ret_24h is None:
+        return None
     return "completed_no_target"
+
+
+def _shadow_candles(conn: sqlite3.Connection, mint: str, entry_time: float) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT ts, open, high, low, close
+        FROM ohlcv_1m
+        WHERE mint = ? AND ts >= ? AND ts <= ?
+        ORDER BY ts
+        """,
+        (mint, entry_time, entry_time + OUTCOME_WINDOW_SECONDS),
+    ).fetchall()
+
+
+def _nearest_entry_close(conn: sqlite3.Connection, mint: str, entry_time: float) -> tuple[float | None, float | None]:
+    row = conn.execute(
+        """
+        SELECT ts, close
+        FROM ohlcv_1m
+        WHERE mint = ? AND ts BETWEEN ? AND ?
+        ORDER BY ABS(ts - ?), ts
+        LIMIT 1
+        """,
+        (
+            mint,
+            entry_time - ENTRY_CANDLE_TOLERANCE_SECONDS,
+            entry_time + ENTRY_CANDLE_TOLERANCE_SECONDS,
+            entry_time,
+        ),
+    ).fetchone()
+    if row is None:
+        return None, None
+    close = _num(row["close"])
+    if close is None or close <= 0:
+        return _num(row["ts"]), None
+    return _num(row["ts"]), close
+
+
+def calculate_shadow_outcome(conn: sqlite3.Connection, trade: sqlite3.Row) -> ShadowOutcome:
+    entry_time = float(trade["entry_time"])
+    window_end = entry_time + OUTCOME_WINDOW_SECONDS
+    candles = _shadow_candles(conn, trade["mint"], entry_time)
+    candle_count = len(candles)
+    coverage_pct = min(100.0, candle_count / EXPECTED_1M_CANDLES_24H * 100.0)
+    entry_ts, entry_price = _nearest_entry_close(conn, trade["mint"], entry_time)
+
+    if not candles or entry_price is None:
+        outcome = ShadowOutcome(
+            entry_price=entry_price,
+            final_price=None,
+            ret_24h=None,
+            max_runup_pct=None,
+            max_drawdown_pct=None,
+            coverage_pct=coverage_pct,
+            outcome_quality="NO_DATA",
+            tp_sl_result=None,
+            exit_result=None,
+        )
+        return outcome
+
+    final_candle = candles[-1]
+    final_ts = float(final_candle["ts"])
+    final_price = _num(final_candle["close"]) if final_ts >= window_end - FINAL_CANDLE_TOLERANCE_SECONDS else None
+    highs = [_num(candle["high"]) for candle in candles]
+    highs = [value for value in highs if value is not None and value > 0]
+    lows = [_num(candle["low"]) for candle in candles]
+    lows = [value for value in lows if value is not None and value > 0]
+
+    ret_24h = (final_price / entry_price - 1.0) * 100.0 if final_price is not None else None
+    max_runup_pct = (max(highs) / entry_price - 1.0) * 100.0 if highs else None
+    max_drawdown_pct = min(0.0, (min(lows) / entry_price - 1.0) * 100.0) if lows else None
+
+    max_gap = 0.0
+    previous_ts = float(candles[0]["ts"])
+    for candle in candles[1:]:
+        ts = float(candle["ts"])
+        max_gap = max(max_gap, ts - previous_ts)
+        previous_ts = ts
+
+    first_ts = float(candles[0]["ts"])
+    if final_price is None:
+        quality = "STALE"
+    elif (
+        coverage_pct < CLEAN_COVERAGE_PCT
+        or first_ts > entry_time + ENTRY_CANDLE_TOLERANCE_SECONDS
+        or (entry_ts is not None and abs(entry_ts - entry_time) > ENTRY_CANDLE_TOLERANCE_SECONDS)
+        or max_gap > MAX_CLEAN_GAP_SECONDS
+    ):
+        quality = "INCOMPLETE"
+    else:
+        quality = "CLEAN"
+
+    outcome = ShadowOutcome(
+        entry_price=entry_price,
+        final_price=final_price,
+        ret_24h=ret_24h,
+        max_runup_pct=max_runup_pct,
+        max_drawdown_pct=max_drawdown_pct,
+        coverage_pct=coverage_pct,
+        outcome_quality=quality,
+        tp_sl_result=_tp_sl_from_candles(candles, entry_price),
+        exit_result=None,
+    )
+    return ShadowOutcome(
+        entry_price=outcome.entry_price,
+        final_price=outcome.final_price,
+        ret_24h=outcome.ret_24h,
+        max_runup_pct=outcome.max_runup_pct,
+        max_drawdown_pct=outcome.max_drawdown_pct,
+        coverage_pct=outcome.coverage_pct,
+        outcome_quality=outcome.outcome_quality,
+        tp_sl_result=outcome.tp_sl_result or ("NO_TP_OR_SL_24H" if outcome.ret_24h is not None else None),
+        exit_result=_exit_result_from_outcome(outcome),
+    )
 
 
 def update_outcomes(conn: sqlite3.Connection) -> int:
     conn.row_factory = sqlite3.Row
-    labels = _label_by_mint(conn)
     rows = conn.execute("SELECT * FROM v3_shadow_trades").fetchall()
     now = _now()
     updated = 0
     for trade in rows:
-        label = labels.get(trade["mint"])
-        if label is None or label["ret_24h"] is None:
+        window_end = float(trade["entry_time"]) + OUTCOME_WINDOW_SECONDS
+        if trade["status"] != "closed" and now < window_end:
             continue
+        outcome = calculate_shadow_outcome(conn, trade)
         status = "closed"
         cursor = conn.execute(
             """
@@ -423,16 +510,20 @@ def update_outcomes(conn: sqlite3.Connection) -> int:
                 max_drawdown_pct = ?,
                 max_runup_pct = ?,
                 ret_24h = ?,
+                coverage_pct = ?,
+                outcome_quality = ?,
                 status = ?,
                 updated_at = ?
             WHERE shadow_trade_id = ?
             """,
             (
-                _exit_result(label),
-                _tp_sl_result(conn, trade, label),
-                _num(label["max_drawdown_pct"]),
-                _num(label["max_runup_pct"]),
-                _num(label["ret_24h"]),
+                outcome.exit_result,
+                outcome.tp_sl_result,
+                outcome.max_drawdown_pct,
+                outcome.max_runup_pct,
+                outcome.ret_24h,
+                outcome.coverage_pct,
+                outcome.outcome_quality,
                 status,
                 now,
                 trade["shadow_trade_id"],
@@ -476,7 +567,7 @@ def _profit_factor(values: list[float]) -> float | None:
 def _rule_summary(conn: sqlite3.Connection) -> list[str]:
     conn.row_factory = sqlite3.Row
     lines = [
-        "rule_id              total open closed avg_ret median_ret profit_factor rug_rate avg_drawdown avg_runup",
+        "rule_id              total open closed clean avg_ret median_ret profit_factor rug_rate avg_drawdown avg_runup",
     ]
     for rule in RULES:
         rows = conn.execute(
@@ -484,21 +575,50 @@ def _rule_summary(conn: sqlite3.Connection) -> list[str]:
             (rule.rule_id,),
         ).fetchall()
         closed = [row for row in rows if row["status"] == "closed"]
-        returns = [_num(row["ret_24h"]) for row in closed]
+        clean = [row for row in closed if row["outcome_quality"] == "CLEAN"]
+        returns = [_num(row["ret_24h"]) for row in clean]
         returns = [value for value in returns if value is not None]
-        runups = [_num(row["max_runup_pct"]) for row in closed]
-        drawdowns = [_num(row["max_drawdown_pct"]) for row in closed]
-        tp100 = sum(1 for row in closed if str(row["tp_sl_result"] or "").startswith("TP_100"))
-        sl50 = sum(1 for row in closed if str(row["tp_sl_result"] or "").startswith("SL_50"))
-        rugs = sum(1 for row in closed if row["exit_result"] == "rugged")
+        runups = [_num(row["max_runup_pct"]) for row in clean]
+        drawdowns = [_num(row["max_drawdown_pct"]) for row in clean]
+        rugs = sum(1 for row in clean if row["exit_result"] == "rugged")
         closed_n = len(closed)
+        clean_n = len(clean)
         lines.append(
             f"{rule.rule_id:<20} {len(rows):>5} {len(rows) - closed_n:>4} {closed_n:>6}"
+            f" {clean_n:>5}"
             f" {_fmt(_avg(returns)):>7} {_fmt(_median(returns)):>10}"
             f" {_fmt(_profit_factor(returns)):>13}"
-            f" {_pct(rugs / closed_n if closed_n else None):>8}"
+            f" {_pct(rugs / clean_n if clean_n else None):>8}"
             f" {_fmt(_avg([v for v in drawdowns if v is not None])):>12}"
             f" {_fmt(_avg([v for v in runups if v is not None])):>9}"
+        )
+    return lines
+
+
+def _quality_summary(conn: sqlite3.Connection) -> list[str]:
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        SELECT rule_id, outcome_quality, COUNT(*) AS n
+        FROM v3_shadow_trades
+        WHERE status = 'closed'
+        GROUP BY rule_id, outcome_quality
+        ORDER BY rule_id, outcome_quality
+        """
+    ).fetchall()
+    lines = ["rule_id              CLEAN STALE INCOMPLETE NO_DATA UNKNOWN"]
+    by_rule: dict[str, dict[str, int]] = {rule.rule_id: {} for rule in RULES}
+    for row in rows:
+        quality = row["outcome_quality"] or "UNKNOWN"
+        by_rule.setdefault(row["rule_id"], {})[quality] = int(row["n"])
+    for rule in RULES:
+        counts = by_rule.get(rule.rule_id, {})
+        lines.append(
+            f"{rule.rule_id:<20} {counts.get('CLEAN', 0):>5}"
+            f" {counts.get('STALE', 0):>5}"
+            f" {counts.get('INCOMPLETE', 0):>10}"
+            f" {counts.get('NO_DATA', 0):>7}"
+            f" {counts.get('UNKNOWN', 0):>7}"
         )
     return lines
 
@@ -507,7 +627,7 @@ def _recent_trades(conn: sqlite3.Connection, limit: int = 12) -> list[str]:
     rows = conn.execute(
         """
         SELECT mint, entry_time, rule_id, status, exit_result, tp_sl_result,
-               ret_24h, max_runup_pct, max_drawdown_pct
+               ret_24h, max_runup_pct, max_drawdown_pct, coverage_pct, outcome_quality
         FROM v3_shadow_trades
         ORDER BY entry_time DESC, shadow_trade_id DESC
         LIMIT ?
@@ -515,7 +635,7 @@ def _recent_trades(conn: sqlite3.Connection, limit: int = 12) -> list[str]:
         (limit,),
     ).fetchall()
     lines = [
-        "mint                                             entry_time           rule       status exit_result         tp_sl              ret_24h runup drawdown",
+        "mint                                             entry_time           rule       status exit_result         tp_sl              ret_24h runup drawdown coverage quality",
     ]
     if not rows:
         lines.append("(none yet)")
@@ -525,6 +645,7 @@ def _recent_trades(conn: sqlite3.Connection, limit: int = 12) -> list[str]:
             f"{row[0]:<48} {_iso(row[1]):<20} {row[2]:<10} {row[3]:<6}"
             f" {str(row[4] or '-'): <18} {str(row[5] or '-'): <18}"
             f" {_fmt(row[6]):>7} {_fmt(row[7]):>5} {_fmt(row[8]):>8}"
+            f" {_fmt(row[9]):>8} {str(row[10] or '-'):>10}"
         )
     return lines
 
@@ -736,7 +857,19 @@ def report_lines(conn: sqlite3.Connection) -> list[str]:
     ]
     lines.extend(f"- {rule.rule_id}: {rule.description}" for rule in RULES)
     lines.extend(_audit_report(conn, started_at))
-    lines.extend(["", "Rule performance:", *_rule_summary(conn), "", "Recent shadow trades:", *_recent_trades(conn)])
+    lines.extend(
+        [
+            "",
+            "Outcome quality counts:",
+            *_quality_summary(conn),
+            "",
+            "Rule performance (CLEAN outcomes only):",
+            *_rule_summary(conn),
+            "",
+            "Recent shadow trades:",
+            *_recent_trades(conn),
+        ]
+    )
     lines.append("=== END REPORT ===")
     return lines
 
