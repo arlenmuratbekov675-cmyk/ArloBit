@@ -19,7 +19,7 @@ import os
 import sqlite3
 
 DEFAULT_DB_PATH = os.path.join("data", "arlobit.db")
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 OUTCOME_CHECKPOINTS_MIN = (5, 15, 30, 60, 120, 360, 720, 1440)
 
@@ -417,6 +417,54 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_momentum_sniper_open_mint
 CREATE INDEX IF NOT EXISTS idx_momentum_sniper_status ON momentum_sniper_trades(status);
 CREATE INDEX IF NOT EXISTS idx_momentum_sniper_entry_time ON momentum_sniper_trades(entry_time);
 
+CREATE TABLE IF NOT EXISTS token_events (
+    id           INTEGER PRIMARY KEY,
+    mint         TEXT NOT NULL REFERENCES tokens(mint),
+    signature    TEXT,
+    slot         INTEGER,
+    block_time   REAL,
+    wallet       TEXT,
+    side         TEXT,
+    token_amount REAL,
+    sol_amount   REAL,
+    usd_amount   REAL,
+    price        REAL,
+    router       TEXT,
+    program      TEXT,
+    success      INTEGER,
+    created_at   REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_token_events_identity
+    ON token_events(mint, signature, wallet, side);
+CREATE INDEX IF NOT EXISTS idx_token_events_mint_time ON token_events(mint, block_time);
+CREATE INDEX IF NOT EXISTS idx_token_events_side ON token_events(side);
+
+CREATE TABLE IF NOT EXISTS microstructure_features (
+    id                       INTEGER PRIMARY KEY,
+    mint                     TEXT NOT NULL REFERENCES tokens(mint),
+    calculated_at            REAL NOT NULL,
+    tx_count_10s             INTEGER,
+    tx_count_30s             INTEGER,
+    tx_count_60s             INTEGER,
+    buy_count_10s            INTEGER,
+    sell_count_10s           INTEGER,
+    buy_sell_ratio_10s       REAL,
+    interarrival_mean        REAL,
+    interarrival_std         REAL,
+    event_acceleration       REAL,
+    buy_size_entropy         REAL,
+    wallet_entropy           REAL,
+    unique_wallet_growth     REAL,
+    failed_buy_count         INTEGER,
+    failed_buy_ratio         REAL,
+    large_buy_concentration  REAL,
+    created_at               REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_micro_features_mint_calc ON microstructure_features(mint, calculated_at);
+CREATE INDEX IF NOT EXISTS idx_micro_features_tx60 ON microstructure_features(tx_count_60s);
+CREATE INDEX IF NOT EXISTS idx_micro_features_accel ON microstructure_features(event_acceleration);
+CREATE INDEX IF NOT EXISTS idx_micro_features_wallet_entropy ON microstructure_features(wallet_entropy);
+
 CREATE VIEW IF NOT EXISTS ml_dataset AS
 SELECT s.*,
        t.pair_created_at, t.first_source,
@@ -736,6 +784,60 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             CREATE INDEX IF NOT EXISTS idx_momentum_sniper_entry_time ON momentum_sniper_trades(entry_time);
             """
         )
+    if version < 11:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS token_events (
+                id           INTEGER PRIMARY KEY,
+                mint         TEXT NOT NULL REFERENCES tokens(mint),
+                signature    TEXT,
+                slot         INTEGER,
+                block_time   REAL,
+                wallet       TEXT,
+                side         TEXT,
+                token_amount REAL,
+                sol_amount   REAL,
+                usd_amount   REAL,
+                price        REAL,
+                router       TEXT,
+                program      TEXT,
+                success      INTEGER,
+                created_at   REAL NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_token_events_identity
+                ON token_events(mint, signature, wallet, side);
+            CREATE INDEX IF NOT EXISTS idx_token_events_mint_time ON token_events(mint, block_time);
+            CREATE INDEX IF NOT EXISTS idx_token_events_side ON token_events(side);
+
+            CREATE TABLE IF NOT EXISTS microstructure_features (
+                id                       INTEGER PRIMARY KEY,
+                mint                     TEXT NOT NULL REFERENCES tokens(mint),
+                calculated_at            REAL NOT NULL,
+                tx_count_10s             INTEGER,
+                tx_count_30s             INTEGER,
+                tx_count_60s             INTEGER,
+                buy_count_10s            INTEGER,
+                sell_count_10s           INTEGER,
+                buy_sell_ratio_10s       REAL,
+                interarrival_mean        REAL,
+                interarrival_std         REAL,
+                event_acceleration       REAL,
+                buy_size_entropy         REAL,
+                wallet_entropy           REAL,
+                unique_wallet_growth     REAL,
+                failed_buy_count         INTEGER,
+                failed_buy_ratio         REAL,
+                large_buy_concentration  REAL,
+                created_at               REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_micro_features_mint_calc
+                ON microstructure_features(mint, calculated_at);
+            CREATE INDEX IF NOT EXISTS idx_micro_features_tx60 ON microstructure_features(tx_count_60s);
+            CREATE INDEX IF NOT EXISTS idx_micro_features_accel ON microstructure_features(event_acceleration);
+            CREATE INDEX IF NOT EXISTS idx_micro_features_wallet_entropy
+                ON microstructure_features(wallet_entropy);
+            """
+        )
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     conn.commit()
 
@@ -761,6 +863,8 @@ def summary(conn: sqlite3.Connection) -> list[tuple[str, int]]:
         "v3_shadow_velocity",
         "v3_shadow_trades",
         "momentum_sniper_trades",
+        "token_events",
+        "microstructure_features",
     )
     return [(table, conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in tables]
 
