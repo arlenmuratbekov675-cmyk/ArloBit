@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import random
 import sqlite3
 import statistics
 import time
@@ -25,6 +26,8 @@ DEFAULT_MINT_LIMIT = 20
 DEFAULT_TIMEOUT = 20
 RECENT_LOOKBACK_SECONDS = 10 * 60
 RECENT_LOOKAHEAD_SECONDS = 5 * 60
+MICROSTRUCTURE_BUSY_TIMEOUT_MS = 60_000
+SQLITE_BUSY_BACKOFF_SECONDS = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
 SOL_MINT = early_buyers.SOL_MINT
 USDC_MINT = early_buyers.USDC_MINT
 LAMPORTS_PER_SOL = early_buyers.LAMPORTS_PER_SOL
@@ -52,6 +55,44 @@ def _int(value: Any) -> int | None:
 def _fmt(value: Any, decimals: int = 3) -> str:
     number = _num(value)
     return "-" if number is None else f"{number:.{decimals}f}"
+
+
+def _connect() -> sqlite3.Connection:
+    conn = db.connect()
+    conn.execute(f"PRAGMA busy_timeout={MICROSTRUCTURE_BUSY_TIMEOUT_MS}")
+    return conn
+
+
+def _is_database_locked(exc: sqlite3.OperationalError) -> bool:
+    return "database is locked" in str(exc).lower()
+
+
+def _write_with_retry(context: str, write_fn: Any) -> tuple[bool, int]:
+    for attempt, delay in enumerate(SQLITE_BUSY_BACKOFF_SECONDS, start=1):
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = _connect()
+            affected = write_fn(conn)
+            conn.commit()
+            return True, int(affected or 0)
+        except sqlite3.OperationalError as exc:
+            if conn is not None:
+                conn.rollback()
+            if not _is_database_locked(exc):
+                raise
+            if attempt == len(SQLITE_BUSY_BACKOFF_SECONDS):
+                print(f"[microstructure] skipped {context}: database is locked after {attempt} attempts")
+                return False, 0
+            sleep_for = delay + random.uniform(0.0, min(0.25, delay * 0.25))
+            print(
+                f"[microstructure] database locked while writing {context};"
+                f" retry {attempt}/{len(SQLITE_BUSY_BACKOFF_SECONDS)} in {sleep_for:.2f}s"
+            )
+            time.sleep(sleep_for)
+        finally:
+            if conn is not None:
+                conn.close()
+    return False, 0
 
 
 def _first_string(*values: Any) -> str | None:
@@ -180,7 +221,7 @@ def _event_rows_from_tx(tx: dict[str, Any], mint: str) -> list[tuple[Any, ...]]:
 
 
 def collect_recent(limit: int, timeout: int) -> list[str]:
-    conn = db.connect()
+    conn = _connect()
     try:
         mints = _latest_candidate_mints(conn, limit)
     finally:
@@ -204,23 +245,25 @@ def collect_recent(limit: int, timeout: int) -> list[str]:
     session = requests.Session()
     session.headers.update({"Accept": "application/json", "User-Agent": "ArloBitMicrostructure/0.1"})
     inserted = 0
+    skipped_locked = 0
     failures: Counter[str] = Counter()
-    conn = db.connect()
-    try:
-        for mint, last_seen in mints:
-            start_time = (last_seen - RECENT_LOOKBACK_SECONDS) if last_seen else None
-            end_time = (last_seen + RECENT_LOOKAHEAD_SECONDS) if last_seen else None
-            try:
-                txs = early_buyers.fetch_enhanced_transactions(session, api_key, mint, start_time, end_time, timeout)
-            except Exception as exc:
-                failures[str(exc)] += 1
-                continue
-            rows: list[tuple[Any, ...]] = []
-            for tx in txs:
-                rows.extend(_event_rows_from_tx(tx, mint))
-            if not rows:
-                failures["no swap events for mint"] += 1
-                continue
+
+    for mint, last_seen in mints:
+        start_time = (last_seen - RECENT_LOOKBACK_SECONDS) if last_seen else None
+        end_time = (last_seen + RECENT_LOOKAHEAD_SECONDS) if last_seen else None
+        try:
+            txs = early_buyers.fetch_enhanced_transactions(session, api_key, mint, start_time, end_time, timeout)
+        except Exception as exc:
+            failures[str(exc)] += 1
+            continue
+        rows: list[tuple[Any, ...]] = []
+        for tx in txs:
+            rows.extend(_event_rows_from_tx(tx, mint))
+        if not rows:
+            failures["no swap events for mint"] += 1
+            continue
+
+        def write_events(conn: sqlite3.Connection) -> int:
             cursor = conn.executemany(
                 """
                 INSERT OR IGNORE INTO token_events (
@@ -231,14 +274,19 @@ def collect_recent(limit: int, timeout: int) -> list[str]:
                 """,
                 rows,
             )
-            inserted += cursor.rowcount
-            conn.commit()
-            time.sleep(0.25)
-    finally:
-        conn.close()
+            return cursor.rowcount
+
+        ok, count = _write_with_retry(f"token_events for {mint}", write_events)
+        if ok:
+            inserted += count
+        else:
+            skipped_locked += 1
+            failures["database locked; mint skipped"] += 1
+        time.sleep(0.25)
 
     lines.append("data source: Helius enhanced transactions")
     lines.append(f"events inserted: {inserted}")
+    lines.append(f"mints skipped due to repeated database lock: {skipped_locked}")
     if failures:
         lines.append("collection notes:")
         lines.extend(f"- {reason}: {count}" for reason, count in failures.most_common(10))
@@ -329,7 +377,7 @@ def _features_for_mint(mint: str, events: list[sqlite3.Row], now: float) -> tupl
 
 
 def calculate_features() -> list[str]:
-    conn = db.connect()
+    conn = _connect()
     conn.row_factory = sqlite3.Row
     try:
         mints = [row[0] for row in conn.execute("SELECT DISTINCT mint FROM token_events").fetchall()]
@@ -343,7 +391,15 @@ def calculate_features() -> list[str]:
             features = _features_for_mint(mint, events, now)
             if features is not None:
                 rows.append(features)
-        conn.executemany(
+    finally:
+        conn.close()
+
+    written = 0
+    skipped_locked = 0
+    for row in rows:
+
+        def write_features(conn: sqlite3.Connection) -> int:
+            cursor = conn.execute(
             """
             INSERT INTO microstructure_features (
                 mint, calculated_at, tx_count_10s, tx_count_30s, tx_count_60s,
@@ -354,15 +410,20 @@ def calculate_features() -> list[str]:
             )
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
-            rows,
-        )
-        conn.commit()
-    finally:
-        conn.close()
+                row,
+            )
+            return cursor.rowcount
+
+        ok, count = _write_with_retry(f"microstructure_features for {row[0]}", write_features)
+        if ok:
+            written += count
+        else:
+            skipped_locked += 1
     return [
         "=== MICROSTRUCTURE FEATURES ===",
         f"mints with events: {len(mints)}",
-        f"feature rows written: {len(rows)}",
+        f"feature rows written: {written}",
+        f"mints skipped due to repeated database lock: {skipped_locked}",
         "=== END FEATURES ===",
     ]
 
@@ -394,7 +455,7 @@ def _top_lines(conn: sqlite3.Connection, title: str, column: str, limit: int = 1
 
 
 def report_lines() -> list[str]:
-    conn = db.connect()
+    conn = _connect()
     conn.row_factory = sqlite3.Row
     try:
         event_count = conn.execute("SELECT COUNT(*) FROM token_events").fetchone()[0]
