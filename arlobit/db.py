@@ -19,7 +19,7 @@ import os
 import sqlite3
 
 DEFAULT_DB_PATH = os.path.join("data", "arlobit.db")
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 OUTCOME_CHECKPOINTS_MIN = (5, 15, 30, 60, 120, 360, 720, 1440)
 
@@ -389,6 +389,34 @@ CREATE INDEX IF NOT EXISTS idx_v3_shadow_entry_time ON v3_shadow_trades(entry_ti
 CREATE INDEX IF NOT EXISTS idx_v3_shadow_rule ON v3_shadow_trades(rule_id);
 CREATE INDEX IF NOT EXISTS idx_v3_shadow_status ON v3_shadow_trades(status);
 
+CREATE TABLE IF NOT EXISTS momentum_sniper_trades (
+    id                    INTEGER PRIMARY KEY,
+    mint                  TEXT NOT NULL REFERENCES tokens(mint),
+    symbol                TEXT,
+    entry_time            REAL,
+    entry_price           REAL,
+    liquidity_usd         REAL,
+    vol_m5                REAL,
+    vol_liq_ratio         REAL,
+    buy_sell_ratio_m5     REAL,
+    age_minutes           REAL,
+    is_second_wave        INTEGER,
+    exit_time             REAL,
+    exit_price            REAL,
+    exit_reason           TEXT,
+    pnl_pct               REAL,
+    status                TEXT NOT NULL,
+    max_runup_pct         REAL,
+    max_drawdown_pct      REAL,
+    blocked_reason        TEXT,
+    created_at            REAL NOT NULL,
+    updated_at            REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_momentum_sniper_open_mint
+    ON momentum_sniper_trades(mint) WHERE status = 'open';
+CREATE INDEX IF NOT EXISTS idx_momentum_sniper_status ON momentum_sniper_trades(status);
+CREATE INDEX IF NOT EXISTS idx_momentum_sniper_entry_time ON momentum_sniper_trades(entry_time);
+
 CREATE VIEW IF NOT EXISTS ml_dataset AS
 SELECT s.*,
        t.pair_created_at, t.first_source,
@@ -676,6 +704,38 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     if version < 9:
         _add_column_if_missing(conn, "v3_shadow_trades", "coverage_pct", "REAL")
         _add_column_if_missing(conn, "v3_shadow_trades", "outcome_quality", "TEXT")
+    if version < 10:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS momentum_sniper_trades (
+                id                    INTEGER PRIMARY KEY,
+                mint                  TEXT NOT NULL REFERENCES tokens(mint),
+                symbol                TEXT,
+                entry_time            REAL,
+                entry_price           REAL,
+                liquidity_usd         REAL,
+                vol_m5                REAL,
+                vol_liq_ratio         REAL,
+                buy_sell_ratio_m5     REAL,
+                age_minutes           REAL,
+                is_second_wave        INTEGER,
+                exit_time             REAL,
+                exit_price            REAL,
+                exit_reason           TEXT,
+                pnl_pct               REAL,
+                status                TEXT NOT NULL,
+                max_runup_pct         REAL,
+                max_drawdown_pct      REAL,
+                blocked_reason        TEXT,
+                created_at            REAL NOT NULL,
+                updated_at            REAL NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_momentum_sniper_open_mint
+                ON momentum_sniper_trades(mint) WHERE status = 'open';
+            CREATE INDEX IF NOT EXISTS idx_momentum_sniper_status ON momentum_sniper_trades(status);
+            CREATE INDEX IF NOT EXISTS idx_momentum_sniper_entry_time ON momentum_sniper_trades(entry_time);
+            """
+        )
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     conn.commit()
 
@@ -700,6 +760,7 @@ def summary(conn: sqlite3.Connection) -> list[tuple[str, int]]:
         "velocity_signals",
         "v3_shadow_velocity",
         "v3_shadow_trades",
+        "momentum_sniper_trades",
     )
     return [(table, conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in tables]
 
