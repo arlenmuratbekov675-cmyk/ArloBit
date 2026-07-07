@@ -20,6 +20,7 @@ TAKE_PROFIT_PCT = 50.0
 STOP_LOSS_PCT = -20.0
 MAX_HOLD_SECONDS = 60 * 60
 MAX_OPEN_TRADES = 3
+LOOP_INTERVAL_SECONDS = 15
 
 
 def _num(value: Any) -> float | None:
@@ -229,7 +230,7 @@ def update_open_trades(conn: sqlite3.Connection, now: float) -> int:
     return closed
 
 
-def run_once(conn: sqlite3.Connection) -> list[str]:
+def _run_once_with_stats(conn: sqlite3.Connection) -> tuple[list[str], dict[str, int]]:
     now = _now()
     closed = update_open_trades(conn, now)
     rows = _latest_candidate_rows(conn)
@@ -271,7 +272,43 @@ def run_once(conn: sqlite3.Connection) -> list[str]:
         lines.append("- none: 0")
     lines.append(f"open trades count: {open_after}")
     lines.append("=== END RUN ===")
+    stats = {
+        "candidates_evaluated": len(rows),
+        "opened": opened,
+        "closed": closed,
+        "open_trades": open_after,
+    }
+    return lines, stats
+
+
+def run_once(conn: sqlite3.Connection) -> list[str]:
+    lines, _stats = _run_once_with_stats(conn)
     return lines
+
+
+def run_loop() -> None:
+    print("MOMENTUM_SNIPER loop started; press Ctrl+C to stop", flush=True)
+    try:
+        while True:
+            try:
+                conn = db.connect()
+                try:
+                    _lines, stats = _run_once_with_stats(conn)
+                finally:
+                    conn.close()
+                print(
+                    f"{_iso(_now())} "
+                    f"candidates evaluated={stats['candidates_evaluated']} "
+                    f"opened={stats['opened']} "
+                    f"closed={stats['closed']} "
+                    f"open trades={stats['open_trades']}",
+                    flush=True,
+                )
+            except Exception as exc:  # Keep service mode alive for transient DB/API issues.
+                print(f"{_iso(_now())} loop error: {exc}", flush=True)
+            time.sleep(LOOP_INTERVAL_SECONDS)
+    except KeyboardInterrupt:
+        print("MOMENTUM_SNIPER loop stopped", flush=True)
 
 
 def _bucket_liquidity(value: float | None) -> str:
@@ -404,7 +441,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="MOMENTUM_SNIPER isolated paper-only strategy")
     parser.add_argument("--run-once", action="store_true", help="evaluate latest candidates and update open trades")
     parser.add_argument("--report", action="store_true", help="print MOMENTUM_SNIPER report")
+    parser.add_argument("--loop", action="store_true", help="run MOMENTUM_SNIPER continuously every 15 seconds")
     args = parser.parse_args(argv)
+
+    if args.loop:
+        run_loop()
+        return 0
 
     conn = db.connect()
     try:
