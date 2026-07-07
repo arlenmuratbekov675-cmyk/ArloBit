@@ -15,7 +15,10 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+import requests
+
 from arlobit import db
+from arlobit import tracker
 from arlobit import velocity
 
 LABEL_VERSION = 1
@@ -29,6 +32,9 @@ CLEAN_COVERAGE_PCT = 80.0
 ENTRY_CANDLE_TOLERANCE_SECONDS = 120.0
 FINAL_CANDLE_TOLERANCE_SECONDS = 5 * 60.0
 MAX_CLEAN_GAP_SECONDS = 120.0
+SHADOW_BACKFILL_DELAY_SECONDS = 1.0
+DB_LOCK_RETRY_SECONDS = 5.0
+DB_LOCK_RETRIES = 6
 
 
 @dataclass(frozen=True)
@@ -97,6 +103,18 @@ class ShadowOutcome:
     outcome_quality: str
     tp_sl_result: str | None
     exit_result: str | None
+
+
+@dataclass
+class BackfillCounters:
+    eligible: int = 0
+    attempted: int = 0
+    skipped: int = 0
+    candles_inserted: int = 0
+    rate_limited: int = 0
+    no_data: int = 0
+    recalculated: int = 0
+    improved_to_clean: int = 0
 
 
 RULES = (
@@ -491,6 +509,83 @@ def calculate_shadow_outcome(conn: sqlite3.Connection, trade: sqlite3.Row) -> Sh
     )
 
 
+def _write_shadow_outcome(
+    conn: sqlite3.Connection,
+    trade: sqlite3.Row,
+    outcome: ShadowOutcome,
+    now: float,
+) -> int:
+    if outcome.outcome_quality != "CLEAN":
+        cursor = conn.execute(
+            """
+            UPDATE v3_shadow_trades
+            SET coverage_pct = ?,
+                outcome_quality = ?,
+                updated_at = ?
+            WHERE shadow_trade_id = ?
+            """,
+            (
+                outcome.coverage_pct,
+                outcome.outcome_quality,
+                now,
+                trade["shadow_trade_id"],
+            ),
+        )
+        return cursor.rowcount
+
+    cursor = conn.execute(
+        """
+        UPDATE v3_shadow_trades
+        SET exit_result = ?,
+            tp_sl_result = ?,
+            max_drawdown_pct = ?,
+            max_runup_pct = ?,
+            ret_24h = ?,
+            coverage_pct = ?,
+            outcome_quality = ?,
+            status = 'closed',
+            updated_at = ?
+        WHERE shadow_trade_id = ?
+        """,
+        (
+            outcome.exit_result,
+            outcome.tp_sl_result,
+            outcome.max_drawdown_pct,
+            outcome.max_runup_pct,
+            outcome.ret_24h,
+            outcome.coverage_pct,
+            outcome.outcome_quality,
+            now,
+            trade["shadow_trade_id"],
+        ),
+    )
+    return cursor.rowcount
+
+
+def _with_db_lock_retry(operation: Any) -> Any:
+    for attempt in range(DB_LOCK_RETRIES):
+        try:
+            return operation()
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or attempt == DB_LOCK_RETRIES - 1:
+                raise
+            time.sleep(DB_LOCK_RETRY_SECONDS)
+    raise RuntimeError("unreachable database lock retry state")
+
+
+def _write_shadow_outcome_retry(
+    conn: sqlite3.Connection,
+    trade: sqlite3.Row,
+    outcome: ShadowOutcome,
+    now: float,
+) -> int:
+    return _with_db_lock_retry(lambda: _write_shadow_outcome(conn, trade, outcome, now))
+
+
+def _commit_retry(conn: sqlite3.Connection) -> None:
+    _with_db_lock_retry(conn.commit)
+
+
 def update_outcomes(conn: sqlite3.Connection) -> int:
     conn.row_factory = sqlite3.Row
     rows = conn.execute("SELECT * FROM v3_shadow_trades").fetchall()
@@ -501,37 +596,136 @@ def update_outcomes(conn: sqlite3.Connection) -> int:
         if trade["status"] != "closed" and now < window_end:
             continue
         outcome = calculate_shadow_outcome(conn, trade)
-        status = "closed"
-        cursor = conn.execute(
-            """
-            UPDATE v3_shadow_trades
-            SET exit_result = ?,
-                tp_sl_result = ?,
-                max_drawdown_pct = ?,
-                max_runup_pct = ?,
-                ret_24h = ?,
-                coverage_pct = ?,
-                outcome_quality = ?,
-                status = ?,
-                updated_at = ?
-            WHERE shadow_trade_id = ?
-            """,
-            (
-                outcome.exit_result,
-                outcome.tp_sl_result,
-                outcome.max_drawdown_pct,
-                outcome.max_runup_pct,
-                outcome.ret_24h,
-                outcome.coverage_pct,
-                outcome.outcome_quality,
-                status,
-                now,
-                trade["shadow_trade_id"],
-            ),
-        )
-        updated += cursor.rowcount
-    conn.commit()
+        updated += _write_shadow_outcome_retry(conn, trade, outcome, now)
+    _commit_retry(conn)
     return updated
+
+
+def _quality_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        SELECT COALESCE(outcome_quality, 'UNKNOWN') AS quality, COUNT(*) AS n
+        FROM v3_shadow_trades
+        WHERE status = 'closed'
+        GROUP BY COALESCE(outcome_quality, 'UNKNOWN')
+        """
+    ).fetchall()
+    counts = {row["quality"]: int(row["n"]) for row in rows}
+    for quality in ("CLEAN", "STALE", "INCOMPLETE", "NO_DATA"):
+        counts.setdefault(quality, 0)
+    return counts
+
+
+def _print_quality_counts(conn: sqlite3.Connection, title: str) -> None:
+    counts = _quality_counts(conn)
+    print(title)
+    print(f"CLEAN {counts['CLEAN']}")
+    print(f"STALE {counts['STALE']}")
+    print(f"INCOMPLETE {counts['INCOMPLETE']}")
+    print(f"NO_DATA {counts['NO_DATA']}")
+
+
+def _shadow_backfill_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    conn.row_factory = sqlite3.Row
+    return conn.execute(
+        """
+        SELECT st.*, t.pair_address
+        FROM v3_shadow_trades st
+        JOIN tokens t ON t.mint = st.mint
+        WHERE st.entry_time IS NOT NULL
+          AND (st.status = 'open' OR COALESCE(st.outcome_quality, '') != 'CLEAN')
+        ORDER BY st.entry_time, st.shadow_trade_id
+        """
+    ).fetchall()
+
+
+def _insert_ohlcv(conn: sqlite3.Connection, mint: str, candles: list[tuple[float, float, float, float, float, float]]) -> int:
+    if not candles:
+        return 0
+    cursor = _with_db_lock_retry(
+        lambda: conn.executemany(
+            """
+            INSERT OR IGNORE INTO ohlcv_1m (mint, ts, open, high, low, close, volume)
+            VALUES (?,?,?,?,?,?,?)
+            """,
+            [(mint, *candle) for candle in candles],
+        )
+    )
+    return cursor.rowcount
+
+
+def backfill_shadow_ohlcv(conn: sqlite3.Connection, timeout: int = 15) -> BackfillCounters:
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
+    session = requests.Session()
+    session.headers.update({"Accept": "application/json", "User-Agent": "ArloBitV3ShadowBackfill/0.1"})
+    rows = _shadow_backfill_rows(conn)
+    counters = BackfillCounters(eligible=len(rows))
+    now = _now()
+    print(f"total eligible shadow trades: {counters.eligible}")
+
+    for trade in rows:
+        entry_time = float(trade["entry_time"])
+        window_end = entry_time + OUTCOME_WINDOW_SECONDS
+        if now < window_end:
+            counters.skipped += 1
+            outcome = calculate_shadow_outcome(conn, trade)
+            counters.recalculated += 1
+            _write_shadow_outcome_retry(conn, trade, outcome, _now())
+            _commit_retry(conn)
+            continue
+        pair_address = trade["pair_address"]
+        if not pair_address:
+            counters.skipped += 1
+            outcome = calculate_shadow_outcome(conn, trade)
+            counters.recalculated += 1
+            counters.improved_to_clean += int(outcome.outcome_quality == "CLEAN" and trade["outcome_quality"] != "CLEAN")
+            _write_shadow_outcome_retry(conn, trade, outcome, _now())
+            _commit_retry(conn)
+            continue
+
+        before = calculate_shadow_outcome(conn, trade)
+        if before.outcome_quality != "CLEAN":
+            counters.attempted += 1
+            try:
+                candles = tracker.fetch_gt_ohlcv(
+                    session,
+                    pair_address,
+                    trade["mint"],
+                    entry_time,
+                    window_end,
+                    timeout,
+                )
+            except tracker.RateLimited:
+                counters.rate_limited += 1
+                time.sleep(tracker.GT_429_SLEEP_SECONDS)
+                candles = []
+            except requests.RequestException as exc:
+                counters.skipped += 1
+                print(f"fetch failed for {trade['mint'][:12]}... shadow_trade_id={trade['shadow_trade_id']}: {exc}")
+                candles = []
+            if candles:
+                counters.candles_inserted += _insert_ohlcv(conn, trade["mint"], candles)
+                _commit_retry(conn)
+            else:
+                counters.no_data += 1
+            time.sleep(SHADOW_BACKFILL_DELAY_SECONDS)
+
+        outcome = calculate_shadow_outcome(conn, trade)
+        counters.recalculated += 1
+        counters.improved_to_clean += int(outcome.outcome_quality == "CLEAN" and trade["outcome_quality"] != "CLEAN")
+        _write_shadow_outcome_retry(conn, trade, outcome, _now())
+        _commit_retry(conn)
+
+    print(f"trades attempted: {counters.attempted}")
+    print(f"trades skipped: {counters.skipped}")
+    print(f"candles inserted: {counters.candles_inserted}")
+    print(f"GeckoTerminal rate-limit responses: {counters.rate_limited}")
+    print(f"GeckoTerminal no-data responses: {counters.no_data}")
+    print(f"trades recalculated: {counters.recalculated}")
+    print(f"trades improved to CLEAN: {counters.improved_to_clean}")
+    return counters
 
 
 def refresh(conn: sqlite3.Connection) -> tuple[int, int, float]:
@@ -877,11 +1071,19 @@ def report_lines(conn: sqlite3.Connection) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="ArloBit v3 paper-only shadow strategy tracker")
     parser.add_argument("--report", action="store_true", help="refresh and print v3 shadow report")
+    parser.add_argument("--backfill", action="store_true", help="research-only OHLCV backfill for v3 shadow entry windows")
+    parser.add_argument("--timeout", type=int, default=15, help="HTTP timeout seconds for --backfill")
     args = parser.parse_args(argv)
 
     conn = db.connect()
     try:
-        if args.report or not any(vars(args).values()):
+        if args.backfill:
+            _print_quality_counts(conn, "Before backfill quality counts:")
+            backfill_shadow_ohlcv(conn, timeout=args.timeout)
+            _print_quality_counts(conn, "After backfill quality counts:")
+            print("Per-rule quality counts:")
+            print("\n".join(_quality_summary(conn)))
+        if args.report or not (args.report or args.backfill):
             print("\n".join(report_lines(conn)))
     finally:
         conn.close()
