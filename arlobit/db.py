@@ -19,7 +19,7 @@ import os
 import sqlite3
 
 DEFAULT_DB_PATH = os.path.join("data", "arlobit.db")
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 OUTCOME_CHECKPOINTS_MIN = (5, 15, 30, 60, 120, 360, 720, 1440)
 
@@ -411,6 +411,10 @@ CREATE TABLE IF NOT EXISTS momentum_sniper_trades (
     blocked_reason        TEXT,
     strategy_version      TEXT,
     holder_check          TEXT,
+    entry_sighting_id     INTEGER,
+    entry_price_source    TEXT,
+    exit_source           TEXT,
+    exit_source_time      REAL,
     created_at            REAL NOT NULL,
     updated_at            REAL NOT NULL
 );
@@ -418,6 +422,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_momentum_sniper_open_mint
     ON momentum_sniper_trades(mint) WHERE status = 'open';
 CREATE INDEX IF NOT EXISTS idx_momentum_sniper_status ON momentum_sniper_trades(status);
 CREATE INDEX IF NOT EXISTS idx_momentum_sniper_entry_time ON momentum_sniper_trades(entry_time);
+
+CREATE TABLE IF NOT EXISTS momentum_sniper_price_checks (
+    id                    INTEGER PRIMARY KEY,
+    trade_id              INTEGER NOT NULL REFERENCES momentum_sniper_trades(id),
+    mint                  TEXT NOT NULL REFERENCES tokens(mint),
+    checked_at            REAL NOT NULL,
+    price                 REAL,
+    pnl_pct               REAL,
+    source                TEXT,
+    created_at            REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_momentum_price_checks_trade
+    ON momentum_sniper_price_checks(trade_id, checked_at);
+CREATE INDEX IF NOT EXISTS idx_momentum_price_checks_mint
+    ON momentum_sniper_price_checks(mint, checked_at);
 
 CREATE TABLE IF NOT EXISTS token_events (
     id           INTEGER PRIMARY KEY,
@@ -844,6 +863,29 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "momentum_sniper_trades", "strategy_version", "TEXT")
     if version < 13:
         _add_column_if_missing(conn, "momentum_sniper_trades", "holder_check", "TEXT")
+    if version < 14:
+        _add_column_if_missing(conn, "momentum_sniper_trades", "entry_sighting_id", "INTEGER")
+        _add_column_if_missing(conn, "momentum_sniper_trades", "entry_price_source", "TEXT")
+        _add_column_if_missing(conn, "momentum_sniper_trades", "exit_source", "TEXT")
+        _add_column_if_missing(conn, "momentum_sniper_trades", "exit_source_time", "REAL")
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS momentum_sniper_price_checks (
+                id                    INTEGER PRIMARY KEY,
+                trade_id              INTEGER NOT NULL REFERENCES momentum_sniper_trades(id),
+                mint                  TEXT NOT NULL REFERENCES tokens(mint),
+                checked_at            REAL NOT NULL,
+                price                 REAL,
+                pnl_pct               REAL,
+                source                TEXT,
+                created_at            REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_momentum_price_checks_trade
+                ON momentum_sniper_price_checks(trade_id, checked_at);
+            CREATE INDEX IF NOT EXISTS idx_momentum_price_checks_mint
+                ON momentum_sniper_price_checks(mint, checked_at);
+            """
+        )
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     conn.commit()
 
@@ -869,6 +911,7 @@ def summary(conn: sqlite3.Connection) -> list[tuple[str, int]]:
         "v3_shadow_velocity",
         "v3_shadow_trades",
         "momentum_sniper_trades",
+        "momentum_sniper_price_checks",
         "token_events",
         "microstructure_features",
     )

@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from typing import Any
 
 from arlobit import db
-from scanner_v0 import DEFAULT_SOLANA_RPC_URL, build_session, fetch_holder_status, helius_rpc_url
+from scanner_v0 import DEFAULT_SOLANA_RPC_URL, build_session, fetch_current_price, fetch_holder_status, helius_rpc_url
 
 STRATEGY_VERSION = "GOLDEN_WINDOW_SCALP_V1"
 TAKE_PROFIT_PCT = 30.0
@@ -29,6 +29,7 @@ LEGACY_MAX_HOLD_SECONDS = 60 * 60
 MAX_OPEN_TRADES = 3
 LOOP_INTERVAL_SECONDS = 15
 OPEN_TRADE_POLL_SECONDS = 12
+MIN_HOLD_SECONDS = OPEN_TRADE_POLL_SECONDS
 PRICE_REQUEST_DELAY_SECONDS = 0.5
 MAX_ENRICHMENT_ATTEMPTS_PER_CYCLE = 3
 ENRICHMENT_DELAY_SECONDS = 1.0
@@ -99,32 +100,15 @@ def _latest_candidate_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     ).fetchall()
 
 
-def _latest_price(conn: sqlite3.Connection, mint: str, after_ts: float) -> tuple[float | None, float | None]:
-    candle = conn.execute(
-        """
-        SELECT ts, close
-        FROM ohlcv_1m
-        WHERE mint = ? AND ts >= ?
-        ORDER BY ts DESC
-        LIMIT 1
-        """,
-        (mint, after_ts),
-    ).fetchone()
-    if candle and _num(candle["close"]) is not None:
-        return _num(candle["close"]), _num(candle["ts"])
-    sighting = conn.execute(
-        """
-        SELECT seen_at, price_usd
-        FROM candidate_sightings
-        WHERE mint = ? AND seen_at >= ? AND price_usd IS NOT NULL
-        ORDER BY seen_at DESC
-        LIMIT 1
-        """,
-        (mint, after_ts),
-    ).fetchone()
-    if sighting:
-        return _num(sighting["price_usd"]), _num(sighting["seen_at"])
-    return None, None
+def _fresh_dexscreener_price(mint: str) -> tuple[float | None, float, str]:
+    checked_at = _now()
+    session = build_session()
+    try:
+        return fetch_current_price(session, mint, 10), checked_at, "dexscreener_token_pairs"
+    except Exception:
+        return None, checked_at, "dexscreener_token_pairs_error"
+    finally:
+        session.close()
 
 
 def _strategy_params(trade: sqlite3.Row | None = None) -> tuple[float, float, int]:
@@ -296,14 +280,15 @@ def _open_trade(conn: sqlite3.Connection, row: sqlite3.Row, now: float, holder_c
             mint, symbol, entry_time, entry_price, liquidity_usd, vol_m5,
             vol_liq_ratio, buy_sell_ratio_m5, age_minutes, is_second_wave,
             status, max_runup_pct, max_drawdown_pct, blocked_reason,
-            strategy_version, holder_check, created_at, updated_at
+            strategy_version, holder_check, entry_sighting_id, entry_price_source,
+            created_at, updated_at
         )
-        VALUES (?,?,?,?,?,?,?,?,?,?,'open',0,0,NULL,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,'open',0,0,NULL,?,?,?,?,?,?)
         """,
         (
             row["mint"],
             row["symbol"],
-            _num(row["seen_at"]),
+            now,
             _num(row["price_usd"]),
             _num(row["liquidity_usd"]),
             _num(row["vol_m5"]),
@@ -313,11 +298,33 @@ def _open_trade(conn: sqlite3.Connection, row: sqlite3.Row, now: float, holder_c
             is_second_wave,
             STRATEGY_VERSION,
             holder_check,
+            row["sighting_id"],
+            f"candidate_sightings:{row['sighting_id']}",
             now,
             now,
         ),
     )
     return cursor.rowcount > 0
+
+
+def _record_price_check(
+    conn: sqlite3.Connection,
+    trade: sqlite3.Row,
+    checked_at: float,
+    price: float | None,
+    pnl: float | None,
+    source: str,
+    now: float,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO momentum_sniper_price_checks (
+            trade_id, mint, checked_at, price, pnl_pct, source, created_at
+        )
+        VALUES (?,?,?,?,?,?,?)
+        """,
+        (trade["id"], trade["mint"], checked_at, price, pnl, source, now),
+    )
 
 
 def update_open_trades(conn: sqlite3.Connection, now: float, request_delay_seconds: float = 0.0) -> int:
@@ -330,18 +337,19 @@ def update_open_trades(conn: sqlite3.Connection, now: float, request_delay_secon
         take_profit_pct, stop_loss_pct, max_hold_seconds = _strategy_params(trade)
         entry_price = _num(trade["entry_price"])
         entry_time = _num(trade["entry_time"]) or now
-        current_price, price_ts = _latest_price(conn, trade["mint"], entry_time)
+        current_price, price_ts, price_source = _fresh_dexscreener_price(trade["mint"])
         pnl = _ret(current_price, entry_price)
-        runup, drawdown = _path_stats(conn, trade["mint"], entry_time, entry_price or 0.0, max_hold_seconds)
-        runup = max(_num(trade["max_runup_pct"]) or 0.0, runup if runup is not None else pnl if pnl is not None else 0.0)
-        drawdown = min(_num(trade["max_drawdown_pct"]) or 0.0, drawdown if drawdown is not None else pnl if pnl is not None else 0.0)
+        _record_price_check(conn, trade, price_ts, current_price, pnl, price_source, now)
+        runup = max(_num(trade["max_runup_pct"]) or 0.0, pnl if pnl is not None else 0.0)
+        drawdown = min(_num(trade["max_drawdown_pct"]) or 0.0, pnl if pnl is not None else 0.0)
 
         exit_reason = None
-        if pnl is not None and pnl >= take_profit_pct:
+        hold_seconds = now - entry_time
+        if hold_seconds >= MIN_HOLD_SECONDS and pnl is not None and pnl >= take_profit_pct:
             exit_reason = "take_profit"
-        elif pnl is not None and pnl <= stop_loss_pct:
+        elif hold_seconds >= MIN_HOLD_SECONDS and pnl is not None and pnl <= stop_loss_pct:
             exit_reason = "stop_loss"
-        elif now - entry_time >= max_hold_seconds:
+        elif hold_seconds >= max_hold_seconds:
             exit_reason = "max_hold"
 
         if exit_reason:
@@ -349,10 +357,22 @@ def update_open_trades(conn: sqlite3.Connection, now: float, request_delay_secon
                 """
                 UPDATE momentum_sniper_trades
                 SET exit_time=?, exit_price=?, exit_reason=?, pnl_pct=?, status='closed',
-                    max_runup_pct=?, max_drawdown_pct=?, updated_at=?
+                    max_runup_pct=?, max_drawdown_pct=?, exit_source=?, exit_source_time=?,
+                    updated_at=?
                 WHERE id=?
                 """,
-                (price_ts or now, current_price, exit_reason, pnl, runup, drawdown, now, trade["id"]),
+                (
+                    now,
+                    current_price,
+                    exit_reason,
+                    pnl,
+                    runup,
+                    drawdown,
+                    price_source,
+                    price_ts,
+                    now,
+                    trade["id"],
+                ),
             )
             closed += 1
         else:
@@ -615,6 +635,27 @@ def report_lines(conn: sqlite3.Connection) -> list[str]:
     best = max(closed, key=lambda row: _num(row["pnl_pct"]) or -math.inf) if closed else None
     worst = min(closed, key=lambda row: _num(row["pnl_pct"]) or math.inf) if closed else None
     max_drawdown = min((_num(row["max_drawdown_pct"]) for row in rows if _num(row["max_drawdown_pct"]) is not None), default=None)
+    check_rows = conn.execute(
+        """
+        SELECT trade_id, COUNT(*) AS n, MIN(checked_at) AS first_check, MAX(checked_at) AS last_check
+        FROM momentum_sniper_price_checks
+        GROUP BY trade_id
+        """
+    ).fetchall()
+    price_checks = {row["trade_id"]: row for row in check_rows}
+    golden_rows = [row for row in rows if row["strategy_version"] == STRATEGY_VERSION]
+    golden_closed = [row for row in golden_rows if row["status"] == "closed"]
+    check_counts = [price_checks.get(row["id"])["n"] if price_checks.get(row["id"]) else 0 for row in golden_rows]
+    avg_checks = sum(check_counts) / len(check_counts) if check_counts else None
+    hold_seconds = [
+        _num(row["exit_time"]) - _num(row["entry_time"])
+        for row in golden_closed
+        if _num(row["exit_time"]) is not None and _num(row["entry_time"]) is not None
+    ]
+    avg_hold_seconds = sum(hold_seconds) / len(hold_seconds) if hold_seconds else None
+    zero_check_closed = [
+        row for row in golden_closed if not price_checks.get(row["id"]) or price_checks[row["id"]]["n"] == 0
+    ]
 
     lines = [
         "=== MOMENTUM_SNIPER REPORT ===",
@@ -631,11 +672,16 @@ def report_lines(conn: sqlite3.Connection) -> list[str]:
         f"profit factor: {_fmt(_profit_factor(returns))}",
         f"average pnl: {_fmt(avg)}",
         f"median pnl: {_fmt(med)}",
+        f"avg_price_checks_per_trade ({STRATEGY_VERSION}): {_fmt(avg_checks)}",
+        f"avg_hold_seconds ({STRATEGY_VERSION}): {_fmt(avg_hold_seconds)}",
+        f"trades_with_zero_price_checks ({STRATEGY_VERSION} closed): {len(zero_check_closed)}",
         f"best trade: {best['mint'] if best else '-'} {_fmt(best['pnl_pct'] if best else None)}",
         f"worst trade: {worst['mint'] if worst else '-'} {_fmt(worst['pnl_pct'] if worst else None)}",
         f"max drawdown: {_fmt(max_drawdown)}",
         "",
     ]
+    if zero_check_closed:
+        lines.append("WARNING: trades closing without price checks.")
 
     version_counts = _strategy_version_counts(conn)
     lines.append("By strategy_version:")
@@ -648,13 +694,25 @@ def report_lines(conn: sqlite3.Connection) -> list[str]:
         groups.setdefault(str(row["is_second_wave"]), []).append(row)
     lines.extend(_group_lines("By is_second_wave:", groups))
 
-    golden_rows = [row for row in rows if row["strategy_version"] == STRATEGY_VERSION]
     holder_groups: dict[str, list[sqlite3.Row]] = {}
     for row in golden_rows:
         holder_groups.setdefault(str(row["holder_check"] or "unknown"), []).append(row)
     for bucket in ("passed", "unavailable", "failed_high"):
         holder_groups.setdefault(bucket, [])
     lines.extend(["", *_group_lines(f"By holder_check ({STRATEGY_VERSION}):", holder_groups)])
+
+    lines.extend(["", f"Price checks by trade ({STRATEGY_VERSION}):"])
+    lines.append("mint symbol checks first_check last_check exit_source exit_source_time")
+    for row in golden_rows:
+        check = price_checks.get(row["id"])
+        lines.append(
+            f"{row['mint']} {row['symbol'] or '-'} "
+            f"{check['n'] if check else 0} "
+            f"{_iso(check['first_check']) if check else '-'} "
+            f"{_iso(check['last_check']) if check else '-'} "
+            f"{row['exit_source'] or '-'} "
+            f"{_iso(row['exit_source_time']) if row['exit_source_time'] else '-'}"
+        )
 
     group_specs = (
         ("By strategy_version detail:", lambda row: str(row["strategy_version"] or "LEGACY_MOMENTUM_SNIPER")),
