@@ -16,11 +16,17 @@ from typing import Any
 
 from arlobit import db
 
-TAKE_PROFIT_PCT = 50.0
+STRATEGY_VERSION = "GOLDEN_WINDOW_SCALP_V1"
+TAKE_PROFIT_PCT = 30.0
 STOP_LOSS_PCT = -20.0
-MAX_HOLD_SECONDS = 60 * 60
+MAX_HOLD_SECONDS = 30 * 60
+LEGACY_TAKE_PROFIT_PCT = 50.0
+LEGACY_STOP_LOSS_PCT = -20.0
+LEGACY_MAX_HOLD_SECONDS = 60 * 60
 MAX_OPEN_TRADES = 3
 LOOP_INTERVAL_SECONDS = 15
+OPEN_TRADE_POLL_SECONDS = 12
+PRICE_REQUEST_DELAY_SECONDS = 0.5
 
 
 def _num(value: Any) -> float | None:
@@ -115,14 +121,26 @@ def _latest_price(conn: sqlite3.Connection, mint: str, after_ts: float) -> tuple
     return None, None
 
 
-def _path_stats(conn: sqlite3.Connection, mint: str, entry_time: float, entry_price: float) -> tuple[float | None, float | None]:
+def _strategy_params(trade: sqlite3.Row | None = None) -> tuple[float, float, int]:
+    if trade is not None and "strategy_version" in trade.keys() and trade["strategy_version"] != STRATEGY_VERSION:
+        return LEGACY_TAKE_PROFIT_PCT, LEGACY_STOP_LOSS_PCT, LEGACY_MAX_HOLD_SECONDS
+    return TAKE_PROFIT_PCT, STOP_LOSS_PCT, MAX_HOLD_SECONDS
+
+
+def _path_stats(
+    conn: sqlite3.Connection,
+    mint: str,
+    entry_time: float,
+    entry_price: float,
+    max_hold_seconds: int,
+) -> tuple[float | None, float | None]:
     rows = conn.execute(
         """
         SELECT high, low
         FROM ohlcv_1m
         WHERE mint = ? AND ts >= ? AND ts <= ?
         """,
-        (mint, entry_time, entry_time + MAX_HOLD_SECONDS),
+        (mint, entry_time, entry_time + max_hold_seconds),
     ).fetchall()
     highs = [_num(row["high"]) for row in rows]
     lows = [_num(row["low"]) for row in rows]
@@ -138,16 +156,9 @@ def _path_stats(conn: sqlite3.Connection, mint: str, entry_time: float, entry_pr
 def _blocked_reason(row: sqlite3.Row) -> str | None:
     checks = (
         ("liquidity_lt_5000", _num(row["liquidity_usd"]) is not None and _num(row["liquidity_usd"]) >= 5000),
-        ("vol_m5_lt_1000", _num(row["vol_m5"]) is not None and _num(row["vol_m5"]) >= 1000),
-        ("vol_liq_ratio_lt_0_5", _num(row["vol_liq_ratio"]) is not None and _num(row["vol_liq_ratio"]) >= 0.5),
-        (
-            "buy_sell_ratio_outside_0_45_0_75",
-            _num(row["buy_sell_ratio_m5"]) is not None and 0.45 <= _num(row["buy_sell_ratio_m5"]) <= 0.75,
-        ),
-        ("age_lt_180", _num(row["age_minutes"]) is not None and _num(row["age_minutes"]) >= 180),
-        ("not_sellable", str(row["sellable"] or "").lower() == "yes"),
-        ("mint_authority_active", row["mint_authority_active"] != 1),
-        ("freeze_authority_active", row["freeze_authority_active"] != 1),
+        ("age_outside_10_60", _num(row["age_minutes"]) is not None and 10 <= _num(row["age_minutes"]) <= 60),
+        ("top10_gt_16_1", _num(row["top10_pct"]) is not None and _num(row["top10_pct"]) <= 16.1),
+        ("sells_m5_lt_30_5", _num(row["sells_m5"]) is not None and _num(row["sells_m5"]) >= 30.5),
         ("missing_price", _num(row["price_usd"]) is not None and _num(row["price_usd"]) > 0),
     )
     for reason, ok in checks:
@@ -157,16 +168,16 @@ def _blocked_reason(row: sqlite3.Row) -> str | None:
 
 
 def _open_trade(conn: sqlite3.Connection, row: sqlite3.Row, now: float) -> bool:
-    is_second_wave = 1 if (_num(row["age_minutes"]) or 0.0) >= 180 else 0
+    is_second_wave = 0
     cursor = conn.execute(
         """
         INSERT OR IGNORE INTO momentum_sniper_trades (
             mint, symbol, entry_time, entry_price, liquidity_usd, vol_m5,
             vol_liq_ratio, buy_sell_ratio_m5, age_minutes, is_second_wave,
             status, max_runup_pct, max_drawdown_pct, blocked_reason,
-            created_at, updated_at
+            strategy_version, created_at, updated_at
         )
-        VALUES (?,?,?,?,?,?,?,?,?,?,'open',0,0,NULL,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,'open',0,0,NULL,?,?,?)
         """,
         (
             row["mint"],
@@ -179,6 +190,7 @@ def _open_trade(conn: sqlite3.Connection, row: sqlite3.Row, now: float) -> bool:
             _num(row["buy_sell_ratio_m5"]),
             _num(row["age_minutes"]),
             is_second_wave,
+            STRATEGY_VERSION,
             now,
             now,
         ),
@@ -186,25 +198,28 @@ def _open_trade(conn: sqlite3.Connection, row: sqlite3.Row, now: float) -> bool:
     return cursor.rowcount > 0
 
 
-def update_open_trades(conn: sqlite3.Connection, now: float) -> int:
+def update_open_trades(conn: sqlite3.Connection, now: float, request_delay_seconds: float = 0.0) -> int:
     conn.row_factory = sqlite3.Row
     rows = conn.execute("SELECT * FROM momentum_sniper_trades WHERE status='open' ORDER BY entry_time").fetchall()
     closed = 0
-    for trade in rows:
+    for index, trade in enumerate(rows):
+        if index and request_delay_seconds > 0:
+            time.sleep(request_delay_seconds)
+        take_profit_pct, stop_loss_pct, max_hold_seconds = _strategy_params(trade)
         entry_price = _num(trade["entry_price"])
         entry_time = _num(trade["entry_time"]) or now
         current_price, price_ts = _latest_price(conn, trade["mint"], entry_time)
         pnl = _ret(current_price, entry_price)
-        runup, drawdown = _path_stats(conn, trade["mint"], entry_time, entry_price or 0.0)
+        runup, drawdown = _path_stats(conn, trade["mint"], entry_time, entry_price or 0.0, max_hold_seconds)
         runup = max(_num(trade["max_runup_pct"]) or 0.0, runup if runup is not None else pnl if pnl is not None else 0.0)
         drawdown = min(_num(trade["max_drawdown_pct"]) or 0.0, drawdown if drawdown is not None else pnl if pnl is not None else 0.0)
 
         exit_reason = None
-        if pnl is not None and pnl >= TAKE_PROFIT_PCT:
+        if pnl is not None and pnl >= take_profit_pct:
             exit_reason = "take_profit"
-        elif pnl is not None and pnl <= STOP_LOSS_PCT:
+        elif pnl is not None and pnl <= stop_loss_pct:
             exit_reason = "stop_loss"
-        elif now - entry_time >= MAX_HOLD_SECONDS:
+        elif now - entry_time >= max_hold_seconds:
             exit_reason = "max_hold"
 
         if exit_reason:
@@ -230,9 +245,12 @@ def update_open_trades(conn: sqlite3.Connection, now: float) -> int:
     return closed
 
 
-def _run_once_with_stats(conn: sqlite3.Connection) -> tuple[list[str], dict[str, int]]:
+def _run_once_with_stats(
+    conn: sqlite3.Connection,
+    open_trade_request_delay_seconds: float = 0.0,
+) -> tuple[list[str], dict[str, int]]:
     now = _now()
-    closed = update_open_trades(conn, now)
+    closed = update_open_trades(conn, now, open_trade_request_delay_seconds)
     rows = _latest_candidate_rows(conn)
     opened = 0
     blocked: Counter[str] = Counter()
@@ -259,8 +277,12 @@ def _run_once_with_stats(conn: sqlite3.Connection) -> tuple[list[str], dict[str,
 
     conn.commit()
     open_after = conn.execute("SELECT COUNT(*) FROM momentum_sniper_trades WHERE status='open'").fetchone()[0]
+    version_counts = _strategy_version_counts(conn)
     lines = [
         "=== MOMENTUM_SNIPER RUN ===",
+        f"strategy version: {STRATEGY_VERSION}",
+        f"entry: age 10-60m, top10_pct <= 16.1, sells_m5 >= 30.5, liquidity_usd >= 5000",
+        f"exit: TP +{TAKE_PROFIT_PCT:.0f}%, SL {STOP_LOSS_PCT:.0f}%, max hold {MAX_HOLD_SECONDS // 60}m",
         f"candidates evaluated: {len(rows)}",
         f"opened: {opened}",
         f"closed: {closed}",
@@ -271,12 +293,16 @@ def _run_once_with_stats(conn: sqlite3.Connection) -> tuple[list[str], dict[str,
     else:
         lines.append("- none: 0")
     lines.append(f"open trades count: {open_after}")
+    lines.append("strategy_version counts:")
+    lines.extend(f"- {version}: {count}" for version, count in version_counts.items())
+    lines.append(f"fast polling active: no (--run-once updates open trades once; --loop polls every {OPEN_TRADE_POLL_SECONDS}s)")
     lines.append("=== END RUN ===")
     stats = {
         "candidates_evaluated": len(rows),
         "opened": opened,
         "closed": closed,
         "open_trades": open_after,
+        "fast_polling_active": 0,
     }
     return lines, stats
 
@@ -287,13 +313,35 @@ def run_once(conn: sqlite3.Connection) -> list[str]:
 
 
 def run_loop() -> None:
-    print("MOMENTUM_SNIPER loop started; press Ctrl+C to stop", flush=True)
+    print(
+        "MOMENTUM_SNIPER loop started; "
+        f"fast polling active every {OPEN_TRADE_POLL_SECONDS}s for open trades; press Ctrl+C to stop",
+        flush=True,
+    )
+    next_entry_eval = 0.0
     try:
         while True:
             try:
                 conn = db.connect()
                 try:
-                    _lines, stats = _run_once_with_stats(conn)
+                    now = _now()
+                    if now >= next_entry_eval:
+                        _lines, stats = _run_once_with_stats(conn, PRICE_REQUEST_DELAY_SECONDS)
+                        next_entry_eval = now + LOOP_INTERVAL_SECONDS
+                    else:
+                        closed = update_open_trades(conn, now, PRICE_REQUEST_DELAY_SECONDS)
+                        conn.commit()
+                        open_after = conn.execute(
+                            "SELECT COUNT(*) FROM momentum_sniper_trades WHERE status='open'"
+                        ).fetchone()[0]
+                        stats = {
+                            "candidates_evaluated": 0,
+                            "opened": 0,
+                            "closed": closed,
+                            "open_trades": open_after,
+                            "fast_polling_active": 1,
+                        }
+                    version_counts = _strategy_version_counts(conn)
                 finally:
                     conn.close()
                 print(
@@ -301,12 +349,14 @@ def run_loop() -> None:
                     f"candidates evaluated={stats['candidates_evaluated']} "
                     f"opened={stats['opened']} "
                     f"closed={stats['closed']} "
-                    f"open trades={stats['open_trades']}",
+                    f"open trades={stats['open_trades']} "
+                    f"strategy_version counts={dict(version_counts)} "
+                    f"fast polling active=yes",
                     flush=True,
                 )
             except Exception as exc:  # Keep service mode alive for transient DB/API issues.
                 print(f"{_iso(_now())} loop error: {exc}", flush=True)
-            time.sleep(LOOP_INTERVAL_SECONDS)
+            time.sleep(OPEN_TRADE_POLL_SECONDS)
     except KeyboardInterrupt:
         print("MOMENTUM_SNIPER loop stopped", flush=True)
 
@@ -368,6 +418,18 @@ def _summary(values: list[float]) -> tuple[float | None, float | None, float | N
     )
 
 
+def _strategy_version_counts(conn: sqlite3.Connection) -> Counter[str]:
+    rows = conn.execute(
+        """
+        SELECT COALESCE(strategy_version, 'LEGACY_MOMENTUM_SNIPER') AS version, COUNT(*) AS n
+        FROM momentum_sniper_trades
+        GROUP BY COALESCE(strategy_version, 'LEGACY_MOMENTUM_SNIPER')
+        ORDER BY version
+        """
+    ).fetchall()
+    return Counter({row[0]: row[1] for row in rows})
+
+
 def _group_lines(title: str, groups: dict[str, list[sqlite3.Row]]) -> list[str]:
     lines = [title, "bucket                  n closed win_rate avg_pnl median_pnl"]
     for bucket, rows in sorted(groups.items()):
@@ -401,6 +463,9 @@ def report_lines(conn: sqlite3.Connection) -> list[str]:
     lines = [
         "=== MOMENTUM_SNIPER REPORT ===",
         "isolated paper-only strategy; no live execution, alerts, scanner verdicts, scoring, or existing paper strategy changes",
+        f"active strategy version: {STRATEGY_VERSION}",
+        f"golden window exits: TP +{TAKE_PROFIT_PCT:.0f}%, SL {STOP_LOSS_PCT:.0f}%, max hold {MAX_HOLD_SECONDS // 60}m",
+        f"fast polling active in --loop: yes, every {OPEN_TRADE_POLL_SECONDS}s with {PRICE_REQUEST_DELAY_SECONDS:.1f}s delay between open-trade price checks",
         f"total trades: {len(rows)}",
         f"open trades: {len(open_rows)}",
         f"closed trades: {len(closed)}",
@@ -416,12 +481,19 @@ def report_lines(conn: sqlite3.Connection) -> list[str]:
         "",
     ]
 
+    version_counts = _strategy_version_counts(conn)
+    lines.append("By strategy_version:")
+    for version, count in version_counts.items():
+        lines.append(f"- {version}: {count}")
+    lines.append("")
+
     groups: dict[str, list[sqlite3.Row]] = {}
     for row in rows:
         groups.setdefault(str(row["is_second_wave"]), []).append(row)
     lines.extend(_group_lines("By is_second_wave:", groups))
 
     group_specs = (
+        ("By strategy_version detail:", lambda row: str(row["strategy_version"] or "LEGACY_MOMENTUM_SNIPER")),
         ("By liquidity bucket:", lambda row: _bucket_liquidity(_num(row["liquidity_usd"]))),
         ("By volume bucket:", lambda row: _bucket_volume(_num(row["vol_m5"]))),
         ("By vol_liq_ratio bucket:", lambda row: _bucket_vol_liq(_num(row["vol_liq_ratio"]))),
