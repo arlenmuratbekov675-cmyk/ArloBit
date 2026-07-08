@@ -175,14 +175,22 @@ def _blocked_reason(row: sqlite3.Row) -> str | None:
         ("age_outside_10_60", _num(row["age_minutes"]) is not None and 10 <= _num(row["age_minutes"]) <= 60),
         ("liquidity_lt_5000", _num(row["liquidity_usd"]) is not None and _num(row["liquidity_usd"]) >= 5000),
         ("sells_m5_lt_30_5", _num(row["sells_m5"]) is not None and _num(row["sells_m5"]) >= 30.5),
-        ("top10_pct_unavailable", _num(row["top10_pct"]) is not None),
-        ("top10_gt_16_1", _num(row["top10_pct"]) is not None and _num(row["top10_pct"]) <= 16.1),
+        ("top10_pct_too_high", _num(row["top10_pct"]) is None or _num(row["top10_pct"]) <= 16.1),
         ("missing_price", _num(row["price_usd"]) is not None and _num(row["price_usd"]) > 0),
     )
     for reason, ok in checks:
         if not ok:
             return reason
     return None
+
+
+def _holder_check(row: sqlite3.Row) -> str:
+    top10 = _num(row["top10_pct"])
+    if top10 is None:
+        return "unavailable"
+    if top10 <= 16.1:
+        return "passed"
+    return "failed_high"
 
 
 def _update_holder_fields(conn: sqlite3.Connection, sighting_id: int, holder: Any) -> sqlite3.Row:
@@ -280,7 +288,7 @@ def _maybe_enrich_top10(
     return refreshed or row
 
 
-def _open_trade(conn: sqlite3.Connection, row: sqlite3.Row, now: float) -> bool:
+def _open_trade(conn: sqlite3.Connection, row: sqlite3.Row, now: float, holder_check: str) -> bool:
     is_second_wave = 0
     cursor = conn.execute(
         """
@@ -288,9 +296,9 @@ def _open_trade(conn: sqlite3.Connection, row: sqlite3.Row, now: float) -> bool:
             mint, symbol, entry_time, entry_price, liquidity_usd, vol_m5,
             vol_liq_ratio, buy_sell_ratio_m5, age_minutes, is_second_wave,
             status, max_runup_pct, max_drawdown_pct, blocked_reason,
-            strategy_version, created_at, updated_at
+            strategy_version, holder_check, created_at, updated_at
         )
-        VALUES (?,?,?,?,?,?,?,?,?,?,'open',0,0,NULL,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,'open',0,0,NULL,?,?,?,?)
         """,
         (
             row["mint"],
@@ -304,6 +312,7 @@ def _open_trade(conn: sqlite3.Connection, row: sqlite3.Row, now: float) -> bool:
             _num(row["age_minutes"]),
             is_second_wave,
             STRATEGY_VERSION,
+            holder_check,
             now,
             now,
         ),
@@ -374,6 +383,8 @@ def _run_once_with_stats(
         "enrichment_successes": 0,
         "enrichment_timeouts": 0,
         "enrichment_time_total_ms": 0.0,
+        "opened_holder_passed": 0,
+        "opened_holder_unavailable": 0,
     }
     attempted_enrichment_mints: set[str] = set()
     open_count = conn.execute("SELECT COUNT(*) FROM momentum_sniper_trades WHERE status='open'").fetchone()[0]
@@ -393,8 +404,13 @@ def _run_once_with_stats(
         if reason is not None:
             blocked[reason] += 1
             continue
-        if _open_trade(conn, row, now):
+        holder_check = _holder_check(row)
+        if _open_trade(conn, row, now, holder_check):
             opened += 1
+            if holder_check == "passed":
+                enrichment_stats["opened_holder_passed"] += 1
+            elif holder_check == "unavailable":
+                enrichment_stats["opened_holder_unavailable"] += 1
             open_count += 1
             open_mints.add(row["mint"])
         else:
@@ -416,9 +432,10 @@ def _run_once_with_stats(
         f"enrichment_timeouts: {int(enrichment_stats['enrichment_timeouts'])}",
         "avg_enrichment_time_ms: "
         f"{(enrichment_stats['enrichment_time_total_ms'] / enrichment_stats['enrichment_attempts']) if enrichment_stats['enrichment_attempts'] else 0.0:.1f}",
-        f"top10_pct_too_high: {blocked['top10_gt_16_1']}",
-        f"still top10_pct_unavailable: {blocked['top10_pct_unavailable']}",
-        f"opened: {opened}",
+        f"opened with holder_check=passed: {int(enrichment_stats['opened_holder_passed'])}",
+        f"opened with holder_check=unavailable: {int(enrichment_stats['opened_holder_unavailable'])}",
+        f"blocked top10_pct_too_high: {blocked['top10_pct_too_high']}",
+        f"opened total: {opened}",
         f"closed: {closed}",
         "blocked reason counts:",
     ]
@@ -440,6 +457,8 @@ def _run_once_with_stats(
         "enrichment_attempts": int(enrichment_stats["enrichment_attempts"]),
         "enrichment_successes": int(enrichment_stats["enrichment_successes"]),
         "enrichment_timeouts": int(enrichment_stats["enrichment_timeouts"]),
+        "opened_holder_passed": int(enrichment_stats["opened_holder_passed"]),
+        "opened_holder_unavailable": int(enrichment_stats["opened_holder_unavailable"]),
     }
     return lines, stats
 
@@ -628,6 +647,14 @@ def report_lines(conn: sqlite3.Connection) -> list[str]:
     for row in rows:
         groups.setdefault(str(row["is_second_wave"]), []).append(row)
     lines.extend(_group_lines("By is_second_wave:", groups))
+
+    golden_rows = [row for row in rows if row["strategy_version"] == STRATEGY_VERSION]
+    holder_groups: dict[str, list[sqlite3.Row]] = {}
+    for row in golden_rows:
+        holder_groups.setdefault(str(row["holder_check"] or "unknown"), []).append(row)
+    for bucket in ("passed", "unavailable", "failed_high"):
+        holder_groups.setdefault(bucket, [])
+    lines.extend(["", *_group_lines(f"By holder_check ({STRATEGY_VERSION}):", holder_groups)])
 
     group_specs = (
         ("By strategy_version detail:", lambda row: str(row["strategy_version"] or "LEGACY_MOMENTUM_SNIPER")),
