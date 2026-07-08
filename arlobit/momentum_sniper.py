@@ -7,14 +7,17 @@ scores, alerts, live execution, the existing paper strategy, or v3 shadow rules.
 from __future__ import annotations
 
 import argparse
+import os
 import math
 import sqlite3
 import statistics
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from typing import Any
 
 from arlobit import db
+from scanner_v0 import DEFAULT_SOLANA_RPC_URL, build_session, fetch_holder_status, helius_rpc_url
 
 STRATEGY_VERSION = "GOLDEN_WINDOW_SCALP_V1"
 TAKE_PROFIT_PCT = 30.0
@@ -27,6 +30,9 @@ MAX_OPEN_TRADES = 3
 LOOP_INTERVAL_SECONDS = 15
 OPEN_TRADE_POLL_SECONDS = 12
 PRICE_REQUEST_DELAY_SECONDS = 0.5
+MAX_ENRICHMENT_ATTEMPTS_PER_CYCLE = 3
+ENRICHMENT_DELAY_SECONDS = 1.0
+ENRICHMENT_TIMEOUT_SECONDS = 5.0
 
 
 def _num(value: Any) -> float | None:
@@ -153,18 +159,125 @@ def _path_stats(
     return max_runup, max_drawdown
 
 
+def _passes_age_liquidity_sells(row: sqlite3.Row) -> bool:
+    return (
+        _num(row["age_minutes"]) is not None
+        and 10 <= _num(row["age_minutes"]) <= 60
+        and _num(row["liquidity_usd"]) is not None
+        and _num(row["liquidity_usd"]) >= 5000
+        and _num(row["sells_m5"]) is not None
+        and _num(row["sells_m5"]) >= 30.5
+    )
+
+
 def _blocked_reason(row: sqlite3.Row) -> str | None:
     checks = (
-        ("liquidity_lt_5000", _num(row["liquidity_usd"]) is not None and _num(row["liquidity_usd"]) >= 5000),
         ("age_outside_10_60", _num(row["age_minutes"]) is not None and 10 <= _num(row["age_minutes"]) <= 60),
-        ("top10_gt_16_1", _num(row["top10_pct"]) is not None and _num(row["top10_pct"]) <= 16.1),
+        ("liquidity_lt_5000", _num(row["liquidity_usd"]) is not None and _num(row["liquidity_usd"]) >= 5000),
         ("sells_m5_lt_30_5", _num(row["sells_m5"]) is not None and _num(row["sells_m5"]) >= 30.5),
+        ("top10_pct_unavailable", _num(row["top10_pct"]) is not None),
+        ("top10_gt_16_1", _num(row["top10_pct"]) is not None and _num(row["top10_pct"]) <= 16.1),
         ("missing_price", _num(row["price_usd"]) is not None and _num(row["price_usd"]) > 0),
     )
     for reason, ok in checks:
         if not ok:
             return reason
     return None
+
+
+def _update_holder_fields(conn: sqlite3.Connection, sighting_id: int, holder: Any) -> sqlite3.Row:
+    conn.execute(
+        """
+        UPDATE candidate_sightings
+        SET enriched=1,
+            top1_pct=?,
+            top10_pct=?,
+            top20_pct=?,
+            holder_status=?
+        WHERE sighting_id=?
+        """,
+        (
+            _num(getattr(holder, "top_1_holder_pct", None)),
+            _num(getattr(holder, "top_10_holders_pct", None)),
+            _num(getattr(holder, "top_20_holders_pct", None)),
+            str(getattr(holder, "status", "unknown")),
+            sighting_id,
+        ),
+    )
+    return conn.execute(
+        """
+        SELECT s.*, t.symbol
+        FROM candidate_sightings s
+        LEFT JOIN tokens t ON t.mint = s.mint
+        WHERE s.sighting_id = ?
+        """,
+        (sighting_id,),
+    ).fetchone()
+
+
+def _fetch_holder_with_timeout(mint: str) -> tuple[Any | None, float, bool]:
+    start = time.monotonic()
+    rpc_url = os.environ.get("SOLANA_RPC_URL", DEFAULT_SOLANA_RPC_URL)
+    helius_url = helius_rpc_url(os.environ.get("HELIUS_API_KEY"))
+
+    def fetch() -> Any:
+        session = build_session()
+        try:
+            return fetch_holder_status(session, mint, rpc_url, helius_url, int(ENRICHMENT_TIMEOUT_SECONDS))
+        finally:
+            session.close()
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(fetch)
+    try:
+        holder = future.result(timeout=ENRICHMENT_TIMEOUT_SECONDS)
+    except TimeoutError:
+        future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+        return None, (time.monotonic() - start) * 1000.0, True
+    except Exception:
+        executor.shutdown(wait=False, cancel_futures=True)
+        return None, (time.monotonic() - start) * 1000.0, False
+    finally:
+        if future.done():
+            executor.shutdown(wait=False, cancel_futures=True)
+    elapsed_ms = (time.monotonic() - start) * 1000.0
+    if elapsed_ms > ENRICHMENT_TIMEOUT_SECONDS * 1000.0:
+        return None, elapsed_ms, True
+    return holder, elapsed_ms, False
+
+
+def _maybe_enrich_top10(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    attempted_mints: set[str],
+    stats: dict[str, int | float],
+) -> sqlite3.Row:
+    if not _passes_age_liquidity_sells(row):
+        return row
+    if _num(row["top10_pct"]) is not None:
+        stats["top10_already_available"] += 1
+        return row
+    if row["mint"] in attempted_mints:
+        return row
+    if stats["enrichment_attempts"] >= MAX_ENRICHMENT_ATTEMPTS_PER_CYCLE:
+        return row
+    if stats["enrichment_attempts"] > 0:
+        time.sleep(ENRICHMENT_DELAY_SECONDS)
+
+    attempted_mints.add(row["mint"])
+    stats["enrichment_attempts"] += 1
+    holder, elapsed_ms, timed_out = _fetch_holder_with_timeout(row["mint"])
+    stats["enrichment_time_total_ms"] += elapsed_ms
+    if timed_out:
+        stats["enrichment_timeouts"] += 1
+        return row
+    if holder is None or getattr(holder, "status", None) != "ok" or _num(getattr(holder, "top_10_holders_pct", None)) is None:
+        return row
+
+    stats["enrichment_successes"] += 1
+    refreshed = _update_holder_fields(conn, int(row["sighting_id"]), holder)
+    return refreshed or row
 
 
 def _open_trade(conn: sqlite3.Connection, row: sqlite3.Row, now: float) -> bool:
@@ -254,12 +367,24 @@ def _run_once_with_stats(
     rows = _latest_candidate_rows(conn)
     opened = 0
     blocked: Counter[str] = Counter()
+    enrichment_stats: dict[str, int | float] = {
+        "passing_age_liquidity_sells": 0,
+        "top10_already_available": 0,
+        "enrichment_attempts": 0,
+        "enrichment_successes": 0,
+        "enrichment_timeouts": 0,
+        "enrichment_time_total_ms": 0.0,
+    }
+    attempted_enrichment_mints: set[str] = set()
     open_count = conn.execute("SELECT COUNT(*) FROM momentum_sniper_trades WHERE status='open'").fetchone()[0]
     open_mints = {
         row[0] for row in conn.execute("SELECT mint FROM momentum_sniper_trades WHERE status='open'").fetchall()
     }
 
     for row in rows:
+        if _passes_age_liquidity_sells(row):
+            enrichment_stats["passing_age_liquidity_sells"] += 1
+        row = _maybe_enrich_top10(conn, row, attempted_enrichment_mints, enrichment_stats)
         reason = _blocked_reason(row)
         if reason is None and row["mint"] in open_mints:
             reason = "already_open_for_mint"
@@ -284,6 +409,15 @@ def _run_once_with_stats(
         f"entry: age 10-60m, top10_pct <= 16.1, sells_m5 >= 30.5, liquidity_usd >= 5000",
         f"exit: TP +{TAKE_PROFIT_PCT:.0f}%, SL {STOP_LOSS_PCT:.0f}%, max hold {MAX_HOLD_SECONDS // 60}m",
         f"candidates evaluated: {len(rows)}",
+        f"candidates passing age+liquidity+sells_m5: {int(enrichment_stats['passing_age_liquidity_sells'])}",
+        f"top10_pct already available: {int(enrichment_stats['top10_already_available'])}",
+        f"enrichment attempts: {int(enrichment_stats['enrichment_attempts'])}",
+        f"enrichment successes: {int(enrichment_stats['enrichment_successes'])}",
+        f"enrichment_timeouts: {int(enrichment_stats['enrichment_timeouts'])}",
+        "avg_enrichment_time_ms: "
+        f"{(enrichment_stats['enrichment_time_total_ms'] / enrichment_stats['enrichment_attempts']) if enrichment_stats['enrichment_attempts'] else 0.0:.1f}",
+        f"top10_pct_too_high: {blocked['top10_gt_16_1']}",
+        f"still top10_pct_unavailable: {blocked['top10_pct_unavailable']}",
         f"opened: {opened}",
         f"closed: {closed}",
         "blocked reason counts:",
@@ -303,6 +437,9 @@ def _run_once_with_stats(
         "closed": closed,
         "open_trades": open_after,
         "fast_polling_active": 0,
+        "enrichment_attempts": int(enrichment_stats["enrichment_attempts"]),
+        "enrichment_successes": int(enrichment_stats["enrichment_successes"]),
+        "enrichment_timeouts": int(enrichment_stats["enrichment_timeouts"]),
     }
     return lines, stats
 
