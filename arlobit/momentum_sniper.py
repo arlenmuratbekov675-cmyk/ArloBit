@@ -19,7 +19,10 @@ from typing import Any
 from arlobit import db
 from scanner_v0 import DEFAULT_SOLANA_RPC_URL, build_session, fetch_current_price, fetch_holder_status, helius_rpc_url
 
-STRATEGY_VERSION = "GOLDEN_WINDOW_SCALP_V1"
+GOLDEN_WINDOW_SCALP_V1 = "GOLDEN_WINDOW_SCALP_V1"
+GOLDEN_WINDOW_SCALP_V2 = "GOLDEN_WINDOW_SCALP_V2"
+STRATEGY_VERSION = GOLDEN_WINDOW_SCALP_V2
+SCALP_STRATEGY_VERSIONS = {GOLDEN_WINDOW_SCALP_V1, GOLDEN_WINDOW_SCALP_V2}
 TAKE_PROFIT_PCT = 30.0
 STOP_LOSS_PCT = -20.0
 MAX_HOLD_SECONDS = 30 * 60
@@ -112,7 +115,11 @@ def _fresh_dexscreener_price(mint: str) -> tuple[float | None, float, str]:
 
 
 def _strategy_params(trade: sqlite3.Row | None = None) -> tuple[float, float, int]:
-    if trade is not None and "strategy_version" in trade.keys() and trade["strategy_version"] != STRATEGY_VERSION:
+    if (
+        trade is not None
+        and "strategy_version" in trade.keys()
+        and trade["strategy_version"] not in SCALP_STRATEGY_VERSIONS
+    ):
         return LEGACY_TAKE_PROFIT_PCT, LEGACY_STOP_LOSS_PCT, LEGACY_MAX_HOLD_SECONDS
     return TAKE_PROFIT_PCT, STOP_LOSS_PCT, MAX_HOLD_SECONDS
 
@@ -154,12 +161,42 @@ def _passes_age_liquidity_sells(row: sqlite3.Row) -> bool:
     )
 
 
-def _blocked_reason(row: sqlite3.Row) -> str | None:
+def _passes_v2_base_filters(row: sqlite3.Row) -> bool:
+    return (
+        _num(row["age_minutes"]) is not None
+        and 10 <= _num(row["age_minutes"]) <= 60
+        and _num(row["liquidity_usd"]) is not None
+        and _num(row["liquidity_usd"]) >= 10000
+        and _num(row["vol_m5"]) is not None
+        and _num(row["vol_m5"]) >= 10000
+        and _num(row["sells_m5"]) is not None
+        and _num(row["sells_m5"]) >= 30.5
+        and _num(row["vol_liq_ratio"]) is not None
+        and _num(row["vol_liq_ratio"]) >= 2.0
+    )
+
+
+def _blocked_reason_v1(row: sqlite3.Row) -> str | None:
     checks = (
         ("age_outside_10_60", _num(row["age_minutes"]) is not None and 10 <= _num(row["age_minutes"]) <= 60),
         ("liquidity_lt_5000", _num(row["liquidity_usd"]) is not None and _num(row["liquidity_usd"]) >= 5000),
         ("sells_m5_lt_30_5", _num(row["sells_m5"]) is not None and _num(row["sells_m5"]) >= 30.5),
         ("top10_pct_too_high", _num(row["top10_pct"]) is None or _num(row["top10_pct"]) <= 16.1),
+        ("missing_price", _num(row["price_usd"]) is not None and _num(row["price_usd"]) > 0),
+    )
+    for reason, ok in checks:
+        if not ok:
+            return reason
+    return None
+
+
+def _blocked_reason_v2(row: sqlite3.Row) -> str | None:
+    checks = (
+        ("age_outside_10_60", _num(row["age_minutes"]) is not None and 10 <= _num(row["age_minutes"]) <= 60),
+        ("liquidity_lt_10000", _num(row["liquidity_usd"]) is not None and _num(row["liquidity_usd"]) >= 10000),
+        ("vol_m5_lt_10000", _num(row["vol_m5"]) is not None and _num(row["vol_m5"]) >= 10000),
+        ("sells_m5_lt_30_5", _num(row["sells_m5"]) is not None and _num(row["sells_m5"]) >= 30.5),
+        ("vol_liq_ratio_lt_2_0", _num(row["vol_liq_ratio"]) is not None and _num(row["vol_liq_ratio"]) >= 2.0),
         ("missing_price", _num(row["price_usd"]) is not None and _num(row["price_usd"]) > 0),
     )
     for reason, ok in checks:
@@ -272,7 +309,13 @@ def _maybe_enrich_top10(
     return refreshed or row
 
 
-def _open_trade(conn: sqlite3.Connection, row: sqlite3.Row, now: float, holder_check: str) -> bool:
+def _open_trade(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    now: float,
+    strategy_version: str,
+    holder_check: str | None,
+) -> bool:
     is_second_wave = 0
     cursor = conn.execute(
         """
@@ -296,7 +339,7 @@ def _open_trade(conn: sqlite3.Connection, row: sqlite3.Row, now: float, holder_c
             _num(row["buy_sell_ratio_m5"]),
             _num(row["age_minutes"]),
             is_second_wave,
-            STRATEGY_VERSION,
+            strategy_version,
             holder_check,
             row["sighting_id"],
             f"candidate_sightings:{row['sighting_id']}",
@@ -398,6 +441,7 @@ def _run_once_with_stats(
     blocked: Counter[str] = Counter()
     enrichment_stats: dict[str, int | float] = {
         "passing_age_liquidity_sells": 0,
+        "passing_v2_filters": 0,
         "top10_already_available": 0,
         "enrichment_attempts": 0,
         "enrichment_successes": 0,
@@ -413,10 +457,9 @@ def _run_once_with_stats(
     }
 
     for row in rows:
-        if _passes_age_liquidity_sells(row):
-            enrichment_stats["passing_age_liquidity_sells"] += 1
-        row = _maybe_enrich_top10(conn, row, attempted_enrichment_mints, enrichment_stats)
-        reason = _blocked_reason(row)
+        if _passes_v2_base_filters(row):
+            enrichment_stats["passing_v2_filters"] += 1
+        reason = _blocked_reason_v2(row)
         if reason is None and row["mint"] in open_mints:
             reason = "already_open_for_mint"
         if reason is None and open_count >= MAX_OPEN_TRADES:
@@ -424,13 +467,9 @@ def _run_once_with_stats(
         if reason is not None:
             blocked[reason] += 1
             continue
-        holder_check = _holder_check(row)
-        if _open_trade(conn, row, now, holder_check):
+        holder_check = None
+        if _open_trade(conn, row, now, STRATEGY_VERSION, holder_check):
             opened += 1
-            if holder_check == "passed":
-                enrichment_stats["opened_holder_passed"] += 1
-            elif holder_check == "unavailable":
-                enrichment_stats["opened_holder_unavailable"] += 1
             open_count += 1
             open_mints.add(row["mint"])
         else:
@@ -442,19 +481,11 @@ def _run_once_with_stats(
     lines = [
         "=== MOMENTUM_SNIPER RUN ===",
         f"strategy version: {STRATEGY_VERSION}",
-        f"entry: age 10-60m, top10_pct <= 16.1, sells_m5 >= 30.5, liquidity_usd >= 5000",
+        "entry: age 10-60m, liquidity_usd >= 10000, vol_m5 >= 10000, "
+        "sells_m5 >= 30.5, vol_liq_ratio >= 2.0",
         f"exit: TP +{TAKE_PROFIT_PCT:.0f}%, SL {STOP_LOSS_PCT:.0f}%, max hold {MAX_HOLD_SECONDS // 60}m",
         f"candidates evaluated: {len(rows)}",
-        f"candidates passing age+liquidity+sells_m5: {int(enrichment_stats['passing_age_liquidity_sells'])}",
-        f"top10_pct already available: {int(enrichment_stats['top10_already_available'])}",
-        f"enrichment attempts: {int(enrichment_stats['enrichment_attempts'])}",
-        f"enrichment successes: {int(enrichment_stats['enrichment_successes'])}",
-        f"enrichment_timeouts: {int(enrichment_stats['enrichment_timeouts'])}",
-        "avg_enrichment_time_ms: "
-        f"{(enrichment_stats['enrichment_time_total_ms'] / enrichment_stats['enrichment_attempts']) if enrichment_stats['enrichment_attempts'] else 0.0:.1f}",
-        f"opened with holder_check=passed: {int(enrichment_stats['opened_holder_passed'])}",
-        f"opened with holder_check=unavailable: {int(enrichment_stats['opened_holder_unavailable'])}",
-        f"blocked top10_pct_too_high: {blocked['top10_pct_too_high']}",
+        f"candidates passing V2 filters: {int(enrichment_stats['passing_v2_filters'])}",
         f"opened total: {opened}",
         f"closed: {closed}",
         "blocked reason counts:",
@@ -474,11 +505,6 @@ def _run_once_with_stats(
         "closed": closed,
         "open_trades": open_after,
         "fast_polling_active": 0,
-        "enrichment_attempts": int(enrichment_stats["enrichment_attempts"]),
-        "enrichment_successes": int(enrichment_stats["enrichment_successes"]),
-        "enrichment_timeouts": int(enrichment_stats["enrichment_timeouts"]),
-        "opened_holder_passed": int(enrichment_stats["opened_holder_passed"]),
-        "opened_holder_unavailable": int(enrichment_stats["opened_holder_unavailable"]),
     }
     return lines, stats
 
@@ -622,6 +648,44 @@ def _group_lines(title: str, groups: dict[str, list[sqlite3.Row]]) -> list[str]:
     return lines
 
 
+def _version_summary_lines(
+    version: str,
+    rows: list[sqlite3.Row],
+    price_checks: dict[int, sqlite3.Row],
+) -> list[str]:
+    version_rows = [row for row in rows if row["strategy_version"] == version]
+    open_rows = [row for row in version_rows if row["status"] == "open"]
+    closed = [row for row in version_rows if row["status"] == "closed"]
+    returns = [_num(row["pnl_pct"]) for row in closed]
+    returns = [value for value in returns if value is not None]
+    avg, med, _avg_win, _avg_loss = _summary(returns)
+    wins = [value for value in returns if value > 0]
+    check_counts = [price_checks.get(row["id"])["n"] if price_checks.get(row["id"]) else 0 for row in version_rows]
+    avg_checks = sum(check_counts) / len(check_counts) if check_counts else None
+    zero_check_closed = [
+        row for row in closed if not price_checks.get(row["id"]) or price_checks[row["id"]]["n"] == 0
+    ]
+    lines = [
+        f"{version} summary:",
+        f"- total: {len(version_rows)}",
+        f"- open: {len(open_rows)}",
+        f"- closed: {len(closed)}",
+        f"- win rate: {_pct(len(wins) / len(returns) * 100 if returns else None)}",
+        f"- avg pnl: {_fmt(avg)}",
+        f"- median pnl: {_fmt(med)}",
+        f"- profit factor: {_fmt(_profit_factor(returns))}",
+        f"- avg price checks: {_fmt(avg_checks)}",
+        f"- zero price check closed trades: {len(zero_check_closed)}",
+        "exit reasons:",
+    ]
+    exit_counts = Counter(str(row["exit_reason"] or row["status"]) for row in version_rows)
+    if exit_counts:
+        lines.extend(f"- {reason}: {count}" for reason, count in sorted(exit_counts.items()))
+    else:
+        lines.append("- none: 0")
+    return lines
+
+
 def report_lines(conn: sqlite3.Connection) -> list[str]:
     conn.row_factory = sqlite3.Row
     rows = conn.execute("SELECT * FROM momentum_sniper_trades ORDER BY entry_time").fetchall()
@@ -687,6 +751,10 @@ def report_lines(conn: sqlite3.Connection) -> list[str]:
     lines.append("By strategy_version:")
     for version, count in version_counts.items():
         lines.append(f"- {version}: {count}")
+    lines.append("")
+    lines.extend(_version_summary_lines(GOLDEN_WINDOW_SCALP_V1, rows, price_checks))
+    lines.append("")
+    lines.extend(_version_summary_lines(GOLDEN_WINDOW_SCALP_V2, rows, price_checks))
     lines.append("")
 
     groups: dict[str, list[sqlite3.Row]] = {}
