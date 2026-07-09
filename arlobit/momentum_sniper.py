@@ -21,11 +21,15 @@ from scanner_v0 import DEFAULT_SOLANA_RPC_URL, build_session, fetch_current_pric
 
 GOLDEN_WINDOW_SCALP_V1 = "GOLDEN_WINDOW_SCALP_V1"
 GOLDEN_WINDOW_SCALP_V2 = "GOLDEN_WINDOW_SCALP_V2"
-STRATEGY_VERSION = GOLDEN_WINDOW_SCALP_V2
-SCALP_STRATEGY_VERSIONS = {GOLDEN_WINDOW_SCALP_V1, GOLDEN_WINDOW_SCALP_V2}
+GOLDEN_WINDOW_SCALP_V3 = "GOLDEN_WINDOW_SCALP_V3"
+STRATEGY_VERSION = GOLDEN_WINDOW_SCALP_V3
+SCALP_STRATEGY_VERSIONS = {GOLDEN_WINDOW_SCALP_V1, GOLDEN_WINDOW_SCALP_V2, GOLDEN_WINDOW_SCALP_V3}
 TAKE_PROFIT_PCT = 30.0
 STOP_LOSS_PCT = -20.0
 MAX_HOLD_SECONDS = 30 * 60
+V3_TAKE_PROFIT_PCT = 50.0
+V3_MAX_HOLD_SECONDS = 5 * 60
+V3_MAX_OPEN_TRADES = 1
 LEGACY_TAKE_PROFIT_PCT = 50.0
 LEGACY_STOP_LOSS_PCT = -20.0
 LEGACY_MAX_HOLD_SECONDS = 60 * 60
@@ -114,12 +118,11 @@ def _fresh_dexscreener_price(mint: str) -> tuple[float | None, float, str]:
         session.close()
 
 
-def _strategy_params(trade: sqlite3.Row | None = None) -> tuple[float, float, int]:
-    if (
-        trade is not None
-        and "strategy_version" in trade.keys()
-        and trade["strategy_version"] not in SCALP_STRATEGY_VERSIONS
-    ):
+def _strategy_params(trade: sqlite3.Row | None = None) -> tuple[float, float | None, int]:
+    version = trade["strategy_version"] if trade is not None and "strategy_version" in trade.keys() else STRATEGY_VERSION
+    if version == GOLDEN_WINDOW_SCALP_V3:
+        return V3_TAKE_PROFIT_PCT, None, V3_MAX_HOLD_SECONDS
+    if trade is not None and version not in SCALP_STRATEGY_VERSIONS:
         return LEGACY_TAKE_PROFIT_PCT, LEGACY_STOP_LOSS_PCT, LEGACY_MAX_HOLD_SECONDS
     return TAKE_PROFIT_PCT, STOP_LOSS_PCT, MAX_HOLD_SECONDS
 
@@ -388,12 +391,23 @@ def update_open_trades(conn: sqlite3.Connection, now: float, request_delay_secon
 
         exit_reason = None
         hold_seconds = now - entry_time
+        version = trade["strategy_version"] if "strategy_version" in trade.keys() else None
         if hold_seconds >= MIN_HOLD_SECONDS and pnl is not None and pnl >= take_profit_pct:
             exit_reason = "take_profit"
-        elif hold_seconds >= MIN_HOLD_SECONDS and pnl is not None and pnl <= stop_loss_pct:
+        elif (
+            version != GOLDEN_WINDOW_SCALP_V3
+            and stop_loss_pct is not None
+            and hold_seconds >= MIN_HOLD_SECONDS
+            and pnl is not None
+            and pnl <= stop_loss_pct
+        ):
             exit_reason = "stop_loss"
-        elif hold_seconds >= max_hold_seconds:
+        elif version == GOLDEN_WINDOW_SCALP_V3 and hold_seconds >= max_hold_seconds:
+            exit_reason = "time_exit"
+        elif version != GOLDEN_WINDOW_SCALP_V3 and hold_seconds >= max_hold_seconds:
             exit_reason = "max_hold"
+        if version == GOLDEN_WINDOW_SCALP_V3 and exit_reason == "stop_loss":
+            exit_reason = None
 
         if exit_reason:
             conn.execute(
@@ -401,7 +415,7 @@ def update_open_trades(conn: sqlite3.Connection, now: float, request_delay_secon
                 UPDATE momentum_sniper_trades
                 SET exit_time=?, exit_price=?, exit_reason=?, pnl_pct=?, status='closed',
                     max_runup_pct=?, max_drawdown_pct=?, exit_source=?, exit_source_time=?,
-                    updated_at=?
+                    time_to_exit_seconds=?, updated_at=?
                 WHERE id=?
                 """,
                 (
@@ -413,6 +427,7 @@ def update_open_trades(conn: sqlite3.Connection, now: float, request_delay_secon
                     drawdown,
                     price_source,
                     price_ts,
+                    hold_seconds,
                     now,
                     trade["id"],
                 ),
@@ -455,23 +470,34 @@ def _run_once_with_stats(
     open_mints = {
         row[0] for row in conn.execute("SELECT mint FROM momentum_sniper_trades WHERE status='open'").fetchall()
     }
+    open_v3_count = conn.execute(
+        "SELECT COUNT(*) FROM momentum_sniper_trades WHERE status='open' AND strategy_version=?",
+        (GOLDEN_WINDOW_SCALP_V3,),
+    ).fetchone()[0]
+    open_v3_mints = {
+        row[0]
+        for row in conn.execute(
+            "SELECT mint FROM momentum_sniper_trades WHERE status='open' AND strategy_version=?",
+            (GOLDEN_WINDOW_SCALP_V3,),
+        ).fetchall()
+    }
 
     for row in rows:
         if _passes_v2_base_filters(row):
             enrichment_stats["passing_v2_filters"] += 1
         reason = _blocked_reason_v2(row)
-        if reason is None and row["mint"] in open_mints:
-            reason = "already_open_for_mint"
-        if reason is None and open_count >= MAX_OPEN_TRADES:
-            reason = "max_open_trades"
+        if reason is None and row["mint"] in open_v3_mints:
+            reason = "already_open_for_mint_v3"
+        if reason is None and open_v3_count >= V3_MAX_OPEN_TRADES:
+            reason = "max_open_trades_v3"
         if reason is not None:
             blocked[reason] += 1
             continue
         holder_check = None
         if _open_trade(conn, row, now, STRATEGY_VERSION, holder_check):
             opened += 1
-            open_count += 1
-            open_mints.add(row["mint"])
+            open_v3_count += 1
+            open_v3_mints.add(row["mint"])
         else:
             blocked["duplicate_trade"] += 1
 
@@ -483,9 +509,10 @@ def _run_once_with_stats(
         f"strategy version: {STRATEGY_VERSION}",
         "entry: age 10-60m, liquidity_usd >= 10000, vol_m5 >= 10000, "
         "sells_m5 >= 30.5, vol_liq_ratio >= 2.0",
-        f"exit: TP +{TAKE_PROFIT_PCT:.0f}%, SL {STOP_LOSS_PCT:.0f}%, max hold {MAX_HOLD_SECONDS // 60}m",
+        f"exit: TP +{V3_TAKE_PROFIT_PCT:.0f}%, no SL, max hold {V3_MAX_HOLD_SECONDS // 60}m",
+        f"max open V3 trades: {V3_MAX_OPEN_TRADES}",
         f"candidates evaluated: {len(rows)}",
-        f"candidates passing V2 filters: {int(enrichment_stats['passing_v2_filters'])}",
+        f"candidates passing V3 filters: {int(enrichment_stats['passing_v2_filters'])}",
         f"opened total: {opened}",
         f"closed: {closed}",
         "blocked reason counts:",
@@ -662,6 +689,12 @@ def _version_summary_lines(
     wins = [value for value in returns if value > 0]
     check_counts = [price_checks.get(row["id"])["n"] if price_checks.get(row["id"]) else 0 for row in version_rows]
     avg_checks = sum(check_counts) / len(check_counts) if check_counts else None
+    hold_seconds = [
+        _num(row["exit_time"]) - _num(row["entry_time"])
+        for row in closed
+        if _num(row["exit_time"]) is not None and _num(row["entry_time"]) is not None
+    ]
+    avg_hold_seconds = sum(hold_seconds) / len(hold_seconds) if hold_seconds else None
     zero_check_closed = [
         row for row in closed if not price_checks.get(row["id"]) or price_checks[row["id"]]["n"] == 0
     ]
@@ -674,6 +707,7 @@ def _version_summary_lines(
         f"- avg pnl: {_fmt(avg)}",
         f"- median pnl: {_fmt(med)}",
         f"- profit factor: {_fmt(_profit_factor(returns))}",
+        f"- avg hold seconds: {_fmt(avg_hold_seconds)}",
         f"- avg price checks: {_fmt(avg_checks)}",
         f"- zero price check closed trades: {len(zero_check_closed)}",
         "exit reasons:",
@@ -684,6 +718,27 @@ def _version_summary_lines(
     else:
         lines.append("- none: 0")
     return lines
+
+
+def _v3_detail_lines(rows: list[sqlite3.Row]) -> list[str]:
+    v3_closed = [
+        row for row in rows if row["strategy_version"] == GOLDEN_WINDOW_SCALP_V3 and row["status"] == "closed"
+    ]
+    take_profit = [row for row in v3_closed if row["exit_reason"] == "take_profit"]
+    time_exit = [row for row in v3_closed if row["exit_reason"] == "time_exit"]
+    tp_returns = [_num(row["pnl_pct"]) for row in take_profit]
+    tx_returns = [_num(row["pnl_pct"]) for row in time_exit]
+    tp_returns = [value for value in tp_returns if value is not None]
+    tx_returns = [value for value in tx_returns if value is not None]
+    return [
+        f"{GOLDEN_WINDOW_SCALP_V3} details:",
+        f"- take_profit count: {len(take_profit)}",
+        f"- time_exit count: {len(time_exit)}",
+        f"- average time_exit pnl: {_fmt(sum(tx_returns) / len(tx_returns) if tx_returns else None)}",
+        f"- median time_exit pnl: {_fmt(statistics.median(tx_returns) if tx_returns else None)}",
+        f"- average take_profit pnl: {_fmt(sum(tp_returns) / len(tp_returns) if tp_returns else None)}",
+        f"- median take_profit pnl: {_fmt(statistics.median(tp_returns) if tp_returns else None)}",
+    ]
 
 
 def report_lines(conn: sqlite3.Connection) -> list[str]:
@@ -725,7 +780,7 @@ def report_lines(conn: sqlite3.Connection) -> list[str]:
         "=== MOMENTUM_SNIPER REPORT ===",
         "isolated paper-only strategy; no live execution, alerts, scanner verdicts, scoring, or existing paper strategy changes",
         f"active strategy version: {STRATEGY_VERSION}",
-        f"golden window exits: TP +{TAKE_PROFIT_PCT:.0f}%, SL {STOP_LOSS_PCT:.0f}%, max hold {MAX_HOLD_SECONDS // 60}m",
+        f"active exits: TP +{V3_TAKE_PROFIT_PCT:.0f}%, no SL, max hold {V3_MAX_HOLD_SECONDS // 60}m",
         f"fast polling active in --loop: yes, every {OPEN_TRADE_POLL_SECONDS}s with {PRICE_REQUEST_DELAY_SECONDS:.1f}s delay between open-trade price checks",
         f"total trades: {len(rows)}",
         f"open trades: {len(open_rows)}",
@@ -755,6 +810,10 @@ def report_lines(conn: sqlite3.Connection) -> list[str]:
     lines.extend(_version_summary_lines(GOLDEN_WINDOW_SCALP_V1, rows, price_checks))
     lines.append("")
     lines.extend(_version_summary_lines(GOLDEN_WINDOW_SCALP_V2, rows, price_checks))
+    lines.append("")
+    lines.extend(_version_summary_lines(GOLDEN_WINDOW_SCALP_V3, rows, price_checks))
+    lines.append("")
+    lines.extend(_v3_detail_lines(rows))
     lines.append("")
 
     groups: dict[str, list[sqlite3.Row]] = {}

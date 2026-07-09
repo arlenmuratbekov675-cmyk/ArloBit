@@ -19,7 +19,7 @@ import os
 import sqlite3
 
 DEFAULT_DB_PATH = os.path.join("data", "arlobit.db")
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 OUTCOME_CHECKPOINTS_MIN = (5, 15, 30, 60, 120, 360, 720, 1440)
 
@@ -415,6 +415,7 @@ CREATE TABLE IF NOT EXISTS momentum_sniper_trades (
     entry_price_source    TEXT,
     exit_source           TEXT,
     exit_source_time      REAL,
+    time_to_exit_seconds  REAL,
     created_at            REAL NOT NULL,
     updated_at            REAL NOT NULL
 );
@@ -886,6 +887,8 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
                 ON momentum_sniper_price_checks(mint, checked_at);
             """
         )
+    if version < 15:
+        _add_column_if_missing(conn, "momentum_sniper_trades", "time_to_exit_seconds", "REAL")
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     conn.commit()
 
